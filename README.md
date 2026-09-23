@@ -72,6 +72,9 @@ known values.
 - Partial `SIGUSR1` progress is not enabled yet. Rows update when their
   individual scans finish.
 - `compsize -x` prevents scans from crossing filesystem boundaries.
+- All direct child directories remain queued for scanning. The selected and
+  visible rows are prioritized so useful results appear sooner without making
+  the sorted view incomplete.
 
 ## Development checks
 

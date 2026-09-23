@@ -212,6 +212,31 @@ class SortingTests(unittest.TestCase):
             ["small-good", "large-modest", "waste", "pending"],
         )
 
+    def test_visible_scan_requests_precede_offscreen_rows(self) -> None:
+        root = Path("/root")
+        entries = tuple(
+            DirectoryEntry(root / name, name)
+            for name in ("alpha", "beta", "gamma", "delta")
+        )
+        model = BrowserModel(root, ResultCache())
+        view_id = model.begin_view(root)
+        model.set_listing(view_id, DirectoryListing(root, entries))
+        model.select(root / "beta")
+
+        requests = model.requests_for_missing_results([root / "delta"])
+
+        self.assertEqual(
+            [
+                request.path.name
+                for request in sorted(requests, key=lambda item: item.priority)
+            ],
+            ["beta", "delta", "alpha", "gamma"],
+        )
+        self.assertEqual(
+            {request.path for request in requests},
+            {root / entry.name for entry in entries},
+        )
+
 
 class NavigationTests(unittest.TestCase):
     """Test path normalization and direct directory enumeration."""

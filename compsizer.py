@@ -27,6 +27,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Label, ListItem, ListView, Static, Tree
 from textual.widgets.tree import TreeNode
@@ -623,25 +624,17 @@ class BrowserModel:
         self.records = {}
         self.listing_warning = listing.warning
         self.listing_error = listing.error
-        requests: list[ScanRequest] = []
         for ordinal, entry in enumerate(listing.entries):
             cached = self.cache.get(entry.path)
             result = cached if cached is not None else ScanResult.pending(entry.path)
             self.records[path_key(entry.path)] = DirectoryRecord(entry, result, ordinal)
-            if cached is None:
-                priority = ordinal
-                if self.selected_path is not None and path_key(
-                    self.selected_path
-                ) == path_key(entry.path):
-                    priority = -1
-                requests.append(ScanRequest(entry.path, view_id, priority))
         if (
             self.selected_path is None
             or path_key(self.selected_path) not in self.records
         ):
             ordered = self.sorted_records()
             self.selected_path = ordered[0].entry.path if ordered else None
-        return requests
+        return self.requests_for_missing_results()
 
     def sorted_records(self) -> list[DirectoryRecord]:
         """Return current rows in the active sort order."""
@@ -691,14 +684,34 @@ class BrowserModel:
         self.records[key] = DirectoryRecord(record.entry, result, record.ordinal)
         return True
 
-    def requests_for_missing_results(self) -> list[ScanRequest]:
-        """Return current rows that still need a scan."""
+    def requests_for_missing_results(
+        self,
+        visible_paths: Iterable[Path] = (),
+    ) -> list[ScanRequest]:
+        """Return missing scans, prioritizing visible rows and selection.
 
-        return [
-            ScanRequest(record.entry.path, self.view_id, index)
-            for index, record in enumerate(self.sorted_records())
-            if record.result.state is not ScanState.COMPLETE
-        ]
+        All missing current-view rows are returned. Visible rows get
+        priorities ahead of off-screen rows so ranking can still converge
+        across the complete sibling set.
+        """
+
+        ordered = self.sorted_records()
+        visible_keys = {path_key(path) for path in visible_paths}
+        selected_key = path_key(self.selected_path) if self.selected_path else None
+        offscreen_start = len(ordered)
+        requests: list[ScanRequest] = []
+        for index, record in enumerate(ordered):
+            if record.result.state is ScanState.COMPLETE:
+                continue
+            key = path_key(record.entry.path)
+            if key == selected_key:
+                priority = -1
+            elif key in visible_keys:
+                priority = index
+            else:
+                priority = offscreen_start + index
+            requests.append(ScanRequest(record.entry.path, self.view_id, priority))
+        return requests
 
 
 ScanCallback = Callable[[ScanJob, ScanResult], Awaitable[None]]
@@ -1012,6 +1025,25 @@ class DirectoryRow(Static):
         return line
 
 
+class DirectoryListView(ListView):
+    """List view that reports viewport changes to the scan scheduler."""
+
+    class VisibilityChanged(Message):
+        """Indicate that a different set of rows is visible."""
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        """Keep the base scroll behavior and notify the application."""
+
+        super().watch_scroll_y(old_value, new_value)
+        if round(old_value) != round(new_value):
+            self.post_message(self.VisibilityChanged())
+
+    def on_resize(self, _event: events.Resize) -> None:
+        """Notify the scheduler when resizing changes the visible rows."""
+
+        self.post_message(self.VisibilityChanged())
+
+
 class HelpScreen(ModalScreen[None]):
     """Show keyboard and data-semantics help over the browser."""
 
@@ -1182,6 +1214,8 @@ class CompsizerApp(App[None]):
         self._row_render_lock = asyncio.Lock()
         self._row_refresh_task: asyncio.Task[Any] | None = None
         self._row_refresh_pending = False
+        self._scan_priority_task: asyncio.Task[Any] | None = None
+        self._scan_priority_pending = False
 
     def compose(self) -> ComposeResult:
         """Compose the two-pane browser layout."""
@@ -1199,7 +1233,7 @@ class CompsizerApp(App[None]):
             with Vertical(id="content-pane"):
                 yield Label(str(self.model.current_path), id="path-label")
                 yield Label(self._column_header(), id="column-label")
-                yield ListView(id="directory-list")
+                yield DirectoryListView(id="directory-list")
                 yield Static("", id="empty-label")
                 yield Static("", id="status")
         yield Footer()
@@ -1274,9 +1308,10 @@ class CompsizerApp(App[None]):
             )
         if view_id != self.model.view_id:
             return
-        requests = self.model.set_listing(view_id, listing)
+        self.model.set_listing(view_id, listing)
         await self._render_rows()
         self._update_status()
+        requests = self.model.requests_for_missing_results(self._visible_paths())
         await self.manager.set_view(view_id, requests)
 
     async def _on_scan_update(self, job: ScanJob, result: ScanResult) -> None:
@@ -1330,9 +1365,18 @@ class CompsizerApp(App[None]):
             desired_items = [
                 self._row_items[path_key(record.entry.path)] for record in records
             ]
-            current_items = [
-                child for child in list_view.children if isinstance(child, ListItem)
-            ]
+            for _attempt in range(3):
+                current_items = [
+                    child for child in list_view.children if isinstance(child, ListItem)
+                ]
+                if len(current_items) == len(desired_items) and all(
+                    item in current_items for item in desired_items
+                ):
+                    break
+                await asyncio.sleep(0)
+            else:
+                self._schedule_row_render()
+                return
             for index, desired_item in enumerate(desired_items):
                 if current_items[index] is desired_item:
                     continue
@@ -1364,6 +1408,7 @@ class CompsizerApp(App[None]):
             else:
                 empty_label.update("No child directories.")
             self._update_status()
+            self._schedule_scan_priority_update()
 
     def _schedule_row_render(self) -> None:
         """Coalesce rapid scan updates into one short UI refresh window."""
@@ -1379,6 +1424,35 @@ class CompsizerApp(App[None]):
             self._row_refresh_pending = False
             await asyncio.sleep(ROW_REFRESH_DELAY)
             await self._render_rows()
+
+    def _visible_paths(self) -> set[Path]:
+        """Return paths of rows currently visible in the right pane."""
+
+        list_view = self.query_one("#directory-list", DirectoryListView)
+        paths: set[Path] = set()
+        for item in list_view.displayed_and_visible_children:
+            if not isinstance(item, ListItem):
+                continue
+            row = next(iter(item.query(DirectoryRow)), None)
+            if row is not None:
+                paths.add(row.record.entry.path)
+        return paths
+
+    def _schedule_scan_priority_update(self) -> None:
+        """Coalesce viewport changes before reprioritizing pending scans."""
+
+        self._scan_priority_pending = True
+        if self._scan_priority_task is None or self._scan_priority_task.done():
+            self._scan_priority_task = self._track(self._flush_scan_priority_updates())
+
+    async def _flush_scan_priority_updates(self) -> None:
+        """Update pending priorities without removing any current-view work."""
+
+        while self._scan_priority_pending:
+            self._scan_priority_pending = False
+            await asyncio.sleep(ROW_REFRESH_DELAY)
+            requests = self.model.requests_for_missing_results(self._visible_paths())
+            await self.manager.set_view(self.model.view_id, requests)
 
     def _set_list_selection(
         self,
@@ -1596,7 +1670,8 @@ class CompsizerApp(App[None]):
         self._schedule_row_render()
         self._track(
             self.manager.set_view(
-                self.model.view_id, self.model.requests_for_missing_results()
+                self.model.view_id,
+                self.model.requests_for_missing_results(self._visible_paths()),
             )
         )
 
@@ -1612,7 +1687,7 @@ class CompsizerApp(App[None]):
                     self.model.records[key] = DirectoryRecord(
                         record.entry, cached, record.ordinal
                     )
-            requests = self.model.requests_for_missing_results()
+            requests = self.model.requests_for_missing_results(self._visible_paths())
             self._track(self.manager.set_view(self.model.view_id, requests))
         self._schedule_row_render()
 
@@ -1635,6 +1710,7 @@ class CompsizerApp(App[None]):
         if row is None:
             return
         self.model.select(row.record.entry.path)
+        self._schedule_scan_priority_update()
         self._update_status()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
@@ -1643,6 +1719,14 @@ class CompsizerApp(App[None]):
         row = next(iter(event.item.query(DirectoryRow)), None)
         if row is not None:
             self._navigate_to(row.record.entry.path)
+
+    def on_directory_list_view_visibility_changed(
+        self,
+        _event: DirectoryListView.VisibilityChanged,
+    ) -> None:
+        """Prioritize rows after the right-pane viewport changes."""
+
+        self._schedule_scan_priority_update()
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
         """Load children after a tree node is expanded."""
