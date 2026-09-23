@@ -453,6 +453,22 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.model.selected_path, selected_path)
                 self.assertEqual(row.record.entry.path, selected_path)
 
+    async def test_late_ui_work_is_ignored_after_unmount(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "child").mkdir()
+            runner = FakeRunner()
+            app = CompsizerApp(root, runner=runner)
+
+            await app.on_unmount()
+            await app._load_view(app.model.view_id, root)
+            await app._on_scan_update(
+                ScanJob(1, root / "child", app.model.view_id, 0),
+                ScanResult(root / "child", ScanState.COMPLETE, 10, 20, 20),
+            )
+
+            self.assertTrue(runner.closed)
+
 
 class ScanManagerTests(unittest.IsolatedAsyncioTestCase):
     """Test bounded asynchronous scan scheduling."""

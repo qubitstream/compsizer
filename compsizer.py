@@ -27,8 +27,10 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.widget import MountError
 from textual.widgets import Footer, Header, Label, ListItem, ListView, Static, Tree
 from textual.widgets.tree import TreeNode
 
@@ -1219,6 +1221,8 @@ class CompsizerApp(App[None]):
         self._row_refresh_pending = False
         self._scan_priority_task: asyncio.Task[Any] | None = None
         self._scan_priority_pending = False
+        self._ui_ready = False
+        self._shutting_down = False
 
     def compose(self) -> ComposeResult:
         """Compose the two-pane browser layout."""
@@ -1244,11 +1248,14 @@ class CompsizerApp(App[None]):
     async def on_mount(self) -> None:
         """Start background services and load the initial directory."""
 
+        self._ui_ready = True
         self._track(self._initialize())
 
     async def on_unmount(self) -> None:
         """Stop directory loading and subprocess workers before exit."""
 
+        self._shutting_down = True
+        self._ui_ready = False
         for task in tuple(self._tasks):
             task.cancel()
         if self._tasks:
@@ -1259,7 +1266,11 @@ class CompsizerApp(App[None]):
         """Start the scan manager and schedule initial filesystem work."""
 
         await self.manager.start()
+        if self._shutting_down:
+            return
         self._navigate_to(self.model.current_path)
+        if self._shutting_down:
+            return
         tree = self.query_one("#directory-tree", Tree)
         tree.root.expand()
         self._track(self._load_tree_children(tree.root))
@@ -1285,6 +1296,8 @@ class CompsizerApp(App[None]):
     def _navigate_to(self, path: Path, *, refresh: bool = False) -> None:
         """Change path and schedule loading without waiting for scans."""
 
+        if self._shutting_down or not self._ui_ready:
+            return
         if self._view_load_task is not None and not self._view_load_task.done():
             self._view_load_task.cancel()
         view_id = self.model.begin_view(path, refresh=refresh)
@@ -1309,10 +1322,12 @@ class CompsizerApp(App[None]):
             listing = DirectoryListing(
                 path=path, error=f"Directory enumeration failed: {exc}"
             )
-        if view_id != self.model.view_id:
+        if self._shutting_down or view_id != self.model.view_id:
             return
         self.model.set_listing(view_id, listing)
         await self._render_rows()
+        if self._shutting_down or not self._ui_ready:
+            return
         self._update_status()
         requests = self.model.requests_for_missing_results(self._visible_paths())
         await self.manager.set_view(view_id, requests)
@@ -1320,6 +1335,8 @@ class CompsizerApp(App[None]):
     async def _on_scan_update(self, job: ScanJob, result: ScanResult) -> None:
         """Apply a scan update and refresh only the affected current view."""
 
+        if self._shutting_down or not self._ui_ready:
+            return
         changed = self.model.apply_scan_update(job, result)
         if changed:
             self._schedule_row_render()
@@ -1328,10 +1345,19 @@ class CompsizerApp(App[None]):
     async def _render_rows(self) -> None:
         """Update row widgets in place and move only rows that changed order."""
 
+        if self._shutting_down or not self._ui_ready:
+            return
         async with self._row_render_lock:
-            list_view = self.query_one("#directory-list", ListView)
+            try:
+                list_view = self.query_one("#directory-list", ListView)
+            except NoMatches:
+                return
             while not list_view.is_attached:
+                if self._shutting_down or not self._ui_ready:
+                    return
                 await asyncio.sleep(0)
+            if self._shutting_down or not self._ui_ready:
+                return
             records = self.model.sorted_records()
             records_by_key = {path_key(record.entry.path): record for record in records}
             maximum_uncompressed = max(
@@ -1363,7 +1389,14 @@ class CompsizerApp(App[None]):
                     row.update_record(record, maximum_uncompressed)
 
             if new_items:
-                await list_view.mount(*new_items)
+                try:
+                    await list_view.mount(*new_items)
+                except MountError:
+                    if self._shutting_down or not list_view.is_attached:
+                        return
+                    raise
+            if self._shutting_down or not self._ui_ready:
+                return
 
             desired_items = [
                 self._row_items[path_key(record.entry.path)] for record in records
@@ -1416,6 +1449,8 @@ class CompsizerApp(App[None]):
     def _schedule_row_render(self) -> None:
         """Coalesce rapid scan updates into one short UI refresh window."""
 
+        if self._shutting_down or not self._ui_ready:
+            return
         self._row_refresh_pending = True
         if self._row_refresh_task is None or self._row_refresh_task.done():
             self._row_refresh_task = self._track(self._flush_row_renders())
@@ -1431,7 +1466,12 @@ class CompsizerApp(App[None]):
     def _visible_paths(self) -> set[Path]:
         """Return paths of rows currently visible in the right pane."""
 
-        list_view = self.query_one("#directory-list", DirectoryListView)
+        if self._shutting_down or not self._ui_ready:
+            return set()
+        try:
+            list_view = self.query_one("#directory-list", DirectoryListView)
+        except NoMatches:
+            return set()
         paths: set[Path] = set()
         for item in list_view.displayed_and_visible_children:
             if not isinstance(item, ListItem):
@@ -1444,6 +1484,8 @@ class CompsizerApp(App[None]):
     def _schedule_scan_priority_update(self) -> None:
         """Coalesce viewport changes before reprioritizing pending scans."""
 
+        if self._shutting_down or not self._ui_ready:
+            return
         self._scan_priority_pending = True
         if self._scan_priority_task is None or self._scan_priority_task.done():
             self._scan_priority_task = self._track(self._flush_scan_priority_updates())
@@ -1454,6 +1496,8 @@ class CompsizerApp(App[None]):
         while self._scan_priority_pending:
             self._scan_priority_pending = False
             await asyncio.sleep(ROW_REFRESH_DELAY)
+            if self._shutting_down or not self._ui_ready:
+                return
             requests = self.model.requests_for_missing_results(self._visible_paths())
             await self.manager.set_view(self.model.view_id, requests)
 
@@ -1502,7 +1546,12 @@ class CompsizerApp(App[None]):
     def _update_path_label(self) -> None:
         """Update the current path and sort indicators."""
 
-        label = self.query_one("#path-label", Label)
+        if self._shutting_down or not self._ui_ready:
+            return
+        try:
+            label = self.query_one("#path-label", Label)
+        except NoMatches:
+            return
         label.update(
             Text(
                 f"{self.model.current_path}  ·  sort: {self.model.sort_mode.value}  ·  "
@@ -1515,7 +1564,12 @@ class CompsizerApp(App[None]):
     def _update_status(self, transient: str | None = None) -> None:
         """Update the concise status and error area."""
 
-        status = self.query_one("#status", Static)
+        if self._shutting_down or not self._ui_ready:
+            return
+        try:
+            status = self.query_one("#status", Static)
+        except NoMatches:
+            return
         if transient:
             status.update(Text(transient))
             return
@@ -1557,6 +1611,8 @@ class CompsizerApp(App[None]):
     async def _load_tree_children(self, node: TreeNode[Any]) -> None:
         """Load one tree node's direct children without recursion."""
 
+        if self._shutting_down or not self._ui_ready:
+            return
         path = node.data
         if not isinstance(path, Path):
             return
@@ -1566,6 +1622,8 @@ class CompsizerApp(App[None]):
         self._tree_loading.add(key)
         try:
             listing = await asyncio.to_thread(enumerate_directories, path)
+            if self._shutting_down or not self._ui_ready:
+                return
             node.remove_children()
             for entry in listing.entries:
                 node.add(self._tree_label(entry.path), entry.path, allow_expand=True)
@@ -1577,7 +1635,12 @@ class CompsizerApp(App[None]):
     async def _reveal_tree_path(self, path: Path) -> None:
         """Reveal the current path in the lazily loaded directory tree."""
 
-        tree = self.query_one("#directory-tree", Tree)
+        if self._shutting_down or not self._ui_ready:
+            return
+        try:
+            tree = self.query_one("#directory-tree", Tree)
+        except NoMatches:
+            return
         root = tree.root
         root_path = root.data
         if not isinstance(root_path, Path):
@@ -1598,6 +1661,8 @@ class CompsizerApp(App[None]):
         node = root
         for part in relative_parts:
             await self._load_tree_children(node)
+            if self._shutting_down or not self._ui_ready:
+                return
             node_path = node.data
             if not isinstance(node_path, Path):
                 return
