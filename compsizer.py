@@ -1477,9 +1477,7 @@ class CompsizerApp(App[None]):
         list_view.index = target_index
         for item_index, item in enumerate(items):
             item.highlighted = item_index == target_index
-        row = next(iter(items[target_index].query(DirectoryRow)), None)
-        if row is not None:
-            self.model.select(row.record.entry.path)
+        self._select_highlighted_list_item(list_view)
         if ensure_visible:
             list_view.scroll_to_widget(
                 items[target_index],
@@ -1487,6 +1485,19 @@ class CompsizerApp(App[None]):
                 force=True,
                 immediate=True,
             )
+
+    def _select_highlighted_list_item(self, list_view: ListView) -> None:
+        """Synchronize model selection with the list's current item."""
+
+        item = list_view.highlighted_child
+        if item is None:
+            return
+        row = next(iter(item.query(DirectoryRow)), None)
+        if row is None:
+            return
+        self.model.select(row.record.entry.path)
+        self._schedule_scan_priority_update()
+        self._update_status()
 
     def _update_path_label(self) -> None:
         """Update the current path and sort indicators."""
@@ -1623,14 +1634,20 @@ class CompsizerApp(App[None]):
         """Move the focused pane upward."""
 
         focused = self.focused
-        if isinstance(focused, (Tree, ListView)):
+        if isinstance(focused, ListView):
+            focused.action_cursor_up()
+            self._select_highlighted_list_item(focused)
+        elif isinstance(focused, Tree):
             focused.action_cursor_up()
 
     def action_move_down(self) -> None:
         """Move the focused pane downward."""
 
         focused = self.focused
-        if isinstance(focused, (Tree, ListView)):
+        if isinstance(focused, ListView):
+            focused.action_cursor_down()
+            self._select_highlighted_list_item(focused)
+        elif isinstance(focused, Tree):
             focused.action_cursor_down()
 
     def action_move_home(self) -> None:
@@ -1707,14 +1724,9 @@ class CompsizerApp(App[None]):
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Keep model selection attached to the highlighted path."""
 
-        if event.item is None:
+        if event.item is None or event.item is not event.list_view.highlighted_child:
             return
-        row = next(iter(event.item.query(DirectoryRow)), None)
-        if row is None:
-            return
-        self.model.select(row.record.entry.path)
-        self._schedule_scan_priority_update()
-        self._update_status()
+        self._select_highlighted_list_item(event.list_view)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Enter the directory selected in the right pane."""

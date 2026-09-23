@@ -14,6 +14,7 @@ from compsizer import (
     DirectoryEntry,
     DirectoryListing,
     DirectoryRecord,
+    DirectoryRow,
     EntryKind,
     InvalidInitialPathError,
     ResultCache,
@@ -325,8 +326,13 @@ class NavigationTests(unittest.TestCase):
 class FakeRunner:
     """Small asynchronous runner used to test bounded scheduling."""
 
-    def __init__(self, delay: float = 0.01) -> None:
+    def __init__(
+        self,
+        delay: float = 0.01,
+        uncompressed_by_name: dict[str, int] | None = None,
+    ) -> None:
         self.delay = delay
+        self.uncompressed_by_name = uncompressed_by_name or {}
         self.active = 0
         self.maximum_active = 0
         self.closed = False
@@ -338,7 +344,9 @@ class FakeRunner:
         self.maximum_active = max(self.maximum_active, self.active)
         try:
             await asyncio.sleep(self.delay)
-            uncompressed = 200 if path.name == "beta" else 100
+            uncompressed = self.uncompressed_by_name.get(
+                path.name, 200 if path.name == "beta" else 100
+            )
             return ScanResult(path, ScanState.COMPLETE, 10, uncompressed, uncompressed)
         finally:
             self.active -= 1
@@ -419,6 +427,31 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.01)
                 self.assertEqual(directory_list.index, 0)
                 self.assertEqual(directory_list.scroll_y, 0)
+
+    async def test_keyboard_selection_survives_pending_row_reordering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            values = {f"directory-{index:02d}": (index + 1) * 100 for index in range(8)}
+            app = CompsizerApp(
+                root,
+                runner=FakeRunner(delay=0.15, uncompressed_by_name=values),
+            )
+            for name in values:
+                (root / name).mkdir()
+
+            async with app.run_test(size=(120, 20)) as pilot:
+                await pilot.pause(0.03)
+                directory_list = app.query_one("#directory-list", ListView)
+                await pilot.press("down")
+                selected_path = root / "directory-01"
+                self.assertEqual(app.model.selected_path, selected_path)
+                await pilot.pause(1.0)
+                highlighted = directory_list.highlighted_child
+                if highlighted is None:
+                    self.fail("The directory list has no highlighted row.")
+                row = highlighted.query_one(DirectoryRow)
+                self.assertEqual(app.model.selected_path, selected_path)
+                self.assertEqual(row.record.entry.path, selected_path)
 
 
 class ScanManagerTests(unittest.IsolatedAsyncioTestCase):
