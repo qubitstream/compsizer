@@ -212,6 +212,34 @@ class SortingTests(unittest.TestCase):
             ["small-good", "large-modest", "waste", "pending"],
         )
 
+    def test_name_sort_orders_all_rows_case_insensitively(self) -> None:
+        records = [
+            self.record("zeta", 0, ScanResult.pending(Path("/root/zeta"))),
+            self.record(
+                "Alpha", 1, ScanResult.error_result(Path("/root/Alpha"), "failed")
+            ),
+            self.record(
+                "beta", 2, ScanResult(Path("/root/beta"), ScanState.COMPLETE, 5, 10, 10)
+            ),
+        ]
+
+        ordered = sort_records(records, SortMode.NAME)
+
+        self.assertEqual(
+            [record.entry.name for record in ordered], ["Alpha", "beta", "zeta"]
+        )
+
+    def test_sort_mode_cycles_through_all_criteria(self) -> None:
+        mode = SortMode.SIZE
+
+        mode = mode.toggled()
+        self.assertIs(mode, SortMode.RATIO)
+        mode = mode.toggled()
+        self.assertIs(mode, SortMode.SAVINGS)
+        mode = mode.toggled()
+        self.assertIs(mode, SortMode.NAME)
+        self.assertIs(mode.toggled(), SortMode.SIZE)
+
     def test_visible_scan_requests_precede_offscreen_rows(self) -> None:
         root = Path("/root")
         entries = tuple(

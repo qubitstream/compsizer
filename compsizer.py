@@ -62,11 +62,12 @@ class SortMode(Enum):
     SIZE = "size"
     RATIO = "ratio"
     SAVINGS = "savings"
+    NAME = "name"
 
     def toggled(self) -> SortMode:
-        """Return the other user-facing sort criterion."""
+        """Return the next user-facing sort criterion."""
 
-        modes = (SortMode.SIZE, SortMode.RATIO, SortMode.SAVINGS)
+        modes = (SortMode.SIZE, SortMode.RATIO, SortMode.SAVINGS, SortMode.NAME)
         return modes[(modes.index(self) + 1) % len(modes)]
 
 
@@ -566,6 +567,8 @@ def sort_records(
         result = record.result
         name_key = record.entry.name.casefold()
         identity = path_key(record.entry.path)
+        if mode is SortMode.NAME:
+            return (0, name_key, "", identity)
         if (
             mode is SortMode.SIZE
             and result.state is ScanState.COMPLETE
@@ -1081,7 +1084,7 @@ Home/End        Select first/last row
 Enter, l        Open selected directory
 Backspace, h    Open parent directory
 Tab             Change pane
-s               Cycle size / ratio / savings sorting
+s               Cycle size / ratio / savings / name sorting
 c               Toggle result cache
 r               Refresh current directory and rescan
 ?               Show this help
@@ -1663,7 +1666,7 @@ class CompsizerApp(App[None]):
             self._navigate_to(parent)
 
     def action_toggle_sort(self) -> None:
-        """Switch between size and ratio sorting."""
+        """Cycle through the available row sorting modes."""
 
         self.model.sort_mode = self.model.sort_mode.toggled()
         self._update_path_label()
