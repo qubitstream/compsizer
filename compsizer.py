@@ -35,6 +35,8 @@ LOGGER = logging.getLogger("compsizer")
 
 DEFAULT_CONCURRENCY = 2
 MAX_DIAGNOSTIC_LENGTH = 500
+ROW_REFRESH_DELAY = 0.02
+BAR_STYLE = "green"
 NAME_COLUMN_WIDTH = 26
 RATIO_COLUMN_WIDTH = 9
 SIZE_COLUMN_WIDTH = 13
@@ -58,13 +60,13 @@ class SortMode(Enum):
 
     SIZE = "size"
     RATIO = "ratio"
+    SAVINGS = "savings"
 
     def toggled(self) -> SortMode:
         """Return the other user-facing sort criterion."""
 
-        if self is SortMode.SIZE:
-            return SortMode.RATIO
-        return SortMode.SIZE
+        modes = (SortMode.SIZE, SortMode.RATIO, SortMode.SAVINGS)
+        return modes[(modes.index(self) + 1) % len(modes)]
 
 
 class EntryKind(Enum):
@@ -134,6 +136,14 @@ class ScanResult:
         if self.disk_usage_bytes is None or self.uncompressed_bytes in (None, 0):
             return None
         return Fraction(self.disk_usage_bytes, self.uncompressed_bytes)
+
+    @property
+    def savings_bytes(self) -> int | None:
+        """Return the byte difference between uncompressed and disk usage."""
+
+        if self.disk_usage_bytes is None or self.uncompressed_bytes is None:
+            return None
+        return self.uncompressed_bytes - self.disk_usage_bytes
 
     @property
     def has_statistics(self) -> bool:
@@ -565,6 +575,10 @@ def sort_records(
             ratio = result.ratio_fraction
             if ratio is not None:
                 return (0, ratio, name_key, identity)
+        if mode is SortMode.SAVINGS and result.state is ScanState.COMPLETE:
+            savings = result.savings_bytes
+            if savings is not None:
+                return (0, -savings, name_key, identity)
         return (1, record.ordinal, name_key, identity)
 
     return sorted(records, key=key)
@@ -929,8 +943,8 @@ def render_bar(
         disk_fraction = max(0.0, result.disk_usage_bytes / maximum_uncompressed)
         logical_cells = min(width, round(width * logical_fraction))
         disk_cells = min(logical_cells, round(width * disk_fraction))
-        bar.append("█" * disk_cells, style="green")
-        bar.append("░" * max(0, logical_cells - disk_cells), style="yellow")
+        bar.append("█" * disk_cells, style=BAR_STYLE)
+        bar.append("░" * max(0, logical_cells - disk_cells), style=BAR_STYLE)
         bar.append(" " * max(0, width - logical_cells))
         return bar
     if result.state is ScanState.ERROR:
@@ -947,6 +961,7 @@ class DirectoryRow(Static):
         super().__init__(markup=False, classes="directory-row")
         self.record = record
         self.maximum_uncompressed = maximum_uncompressed
+        self.tooltip = record.result.error or record.result.warning
 
     def update_record(self, record: DirectoryRecord, maximum_uncompressed: int) -> None:
         """Replace row data and refresh its display."""
@@ -1030,17 +1045,19 @@ class HelpScreen(ModalScreen[None]):
         text = """Compsizer controls
 
 Up/Down, j/k   Move selection
+Home/End        Select first/last row
 Enter, l        Open selected directory
 Backspace, h    Open parent directory
 Tab             Change pane
-s               Sort by size / compression ratio
+s               Cycle size / ratio / savings sorting
 c               Toggle result cache
 r               Refresh current directory and rescan
 ?               Show this help
 q               Quit
 
 Bars show disk usage (█) and the difference from uncompressed
-extent usage (░). The size column shows uncompressed bytes.
+extent usage (░) in the same color. The size column shows
+uncompressed bytes.
 Independent directory scans are not additive because Btrfs
 reflinks and shared extents may overlap.
 
@@ -1136,6 +1153,8 @@ class CompsizerApp(App[None]):
         Binding("k", "move_up", "Move up", show=False),
         Binding("down", "move_down", "Move down"),
         Binding("j", "move_down", "Move down", show=False),
+        Binding("home", "move_home", "First row", key_display="Home", priority=True),
+        Binding("end", "move_end", "Last row", key_display="End", priority=True),
         Binding("enter", "open_selected", "Open", key_display="Enter"),
         Binding("l", "open_selected", "Open", show=False),
         Binding("backspace", "go_parent", "Parent", key_display="Backspace"),
@@ -1159,7 +1178,10 @@ class CompsizerApp(App[None]):
         self._tree_loaded: set[str] = set()
         self._tree_loading: set[str] = set()
         self._row_items: dict[str, ListItem] = {}
+        self._row_widgets: dict[str, DirectoryRow] = {}
         self._row_render_lock = asyncio.Lock()
+        self._row_refresh_task: asyncio.Task[Any] | None = None
+        self._row_refresh_pending = False
 
     def compose(self) -> ComposeResult:
         """Compose the two-pane browser layout."""
@@ -1235,7 +1257,7 @@ class CompsizerApp(App[None]):
         if self._tree_reveal_task is not None and not self._tree_reveal_task.done():
             self._tree_reveal_task.cancel()
         self._tree_reveal_task = self._track(self._reveal_tree_path(path))
-        self._track(self._render_rows())
+        self._schedule_row_render()
 
     async def _load_view(self, view_id: int, path: Path) -> None:
         """Enumerate one view and submit its missing scans."""
@@ -1262,17 +1284,18 @@ class CompsizerApp(App[None]):
 
         changed = self.model.apply_scan_update(job, result)
         if changed:
-            await self._render_rows()
+            self._schedule_row_render()
         self._update_status()
 
     async def _render_rows(self) -> None:
-        """Rebuild rows while restoring selection by path identity."""
+        """Update row widgets in place and move only rows that changed order."""
 
         async with self._row_render_lock:
             list_view = self.query_one("#directory-list", ListView)
             while not list_view.is_attached:
                 await asyncio.sleep(0)
             records = self.model.sorted_records()
+            records_by_key = {path_key(record.entry.path): record for record in records}
             maximum_uncompressed = max(
                 (
                     record.result.uncompressed_bytes or 0
@@ -1281,23 +1304,58 @@ class CompsizerApp(App[None]):
                 ),
                 default=0,
             )
-            items: list[ListItem] = []
-            self._row_items = {}
-            for record in records:
-                row = DirectoryRow(record, maximum_uncompressed)
-                item = ListItem(row)
-                items.append(item)
-                self._row_items[path_key(record.entry.path)] = item
-            list_view.index = None
-            await list_view.remove_children()
-            if items:
-                await list_view.mount(*items)
-                if self.model.selected_path is not None:
-                    selected_item = self._row_items.get(
-                        path_key(self.model.selected_path)
+
+            stale_keys = set(self._row_items) - set(records_by_key)
+            for key in stale_keys:
+                item = self._row_items.pop(key)
+                self._row_widgets.pop(key, None)
+                if item.is_attached:
+                    await item.remove()
+
+            new_items: list[ListItem] = []
+            for key, record in records_by_key.items():
+                row = self._row_widgets.get(key)
+                if row is None:
+                    row = DirectoryRow(record, maximum_uncompressed)
+                    self._row_widgets[key] = row
+                    item = ListItem(row)
+                    self._row_items[key] = item
+                    new_items.append(item)
+                else:
+                    row.update_record(record, maximum_uncompressed)
+
+            if new_items:
+                await list_view.mount(*new_items)
+
+            desired_items = [
+                self._row_items[path_key(record.entry.path)] for record in records
+            ]
+            current_items = [
+                child for child in list_view.children if isinstance(child, ListItem)
+            ]
+            for index, desired_item in enumerate(desired_items):
+                if current_items[index] is desired_item:
+                    continue
+                current_index = current_items.index(desired_item)
+                list_view.move_child(desired_item, before=current_items[index])
+                current_items.insert(index, current_items.pop(current_index))
+
+            selected_index: int | None = None
+            if self.model.selected_path is not None:
+                selected_key = path_key(self.model.selected_path)
+                if selected_key in self._row_items:
+                    selected_index = next(
+                        (
+                            index
+                            for index, record in enumerate(records)
+                            if path_key(record.entry.path) == selected_key
+                        ),
+                        None,
                     )
-                    if selected_item is not None:
-                        list_view.index = items.index(selected_item)
+            if list_view.index != selected_index:
+                list_view.index = selected_index
+            for index, item in enumerate(current_items):
+                item.highlighted = index == selected_index
             empty_label = self.query_one("#empty-label", Static)
             if records:
                 empty_label.update("")
@@ -1306,6 +1364,52 @@ class CompsizerApp(App[None]):
             else:
                 empty_label.update("No child directories.")
             self._update_status()
+
+    def _schedule_row_render(self) -> None:
+        """Coalesce rapid scan updates into one short UI refresh window."""
+
+        self._row_refresh_pending = True
+        if self._row_refresh_task is None or self._row_refresh_task.done():
+            self._row_refresh_task = self._track(self._flush_row_renders())
+
+    async def _flush_row_renders(self) -> None:
+        """Apply pending row updates after a small batching delay."""
+
+        while self._row_refresh_pending:
+            self._row_refresh_pending = False
+            await asyncio.sleep(ROW_REFRESH_DELAY)
+            await self._render_rows()
+
+    def _set_list_selection(
+        self,
+        list_view: ListView,
+        index: int | None,
+        *,
+        ensure_visible: bool,
+    ) -> None:
+        """Set a list cursor and optionally move the viewport to it."""
+
+        items = [child for child in list_view.children if isinstance(child, ListItem)]
+        if not items:
+            list_view.index = None
+            return
+        requested_index = (
+            len(items) - 1 if index is not None and index < 0 else index or 0
+        )
+        target_index = max(0, min(len(items) - 1, requested_index))
+        list_view.index = target_index
+        for item_index, item in enumerate(items):
+            item.highlighted = item_index == target_index
+        row = next(iter(items[target_index].query(DirectoryRow)), None)
+        if row is not None:
+            self.model.select(row.record.entry.path)
+        if ensure_visible:
+            list_view.scroll_to_widget(
+                items[target_index],
+                animate=False,
+                force=True,
+                immediate=True,
+            )
 
     def _update_path_label(self) -> None:
         """Update the current path and sort indicators."""
@@ -1452,6 +1556,24 @@ class CompsizerApp(App[None]):
         if isinstance(focused, (Tree, ListView)):
             focused.action_cursor_down()
 
+    def action_move_home(self) -> None:
+        """Move the focused pane to its first item and reveal it."""
+
+        focused = self.focused
+        if isinstance(focused, ListView):
+            self._set_list_selection(focused, 0, ensure_visible=True)
+        elif isinstance(focused, Tree) and focused.last_line >= 0:
+            focused.move_cursor_to_line(0, animate=False)
+
+    def action_move_end(self) -> None:
+        """Move the focused pane to its last item and reveal it."""
+
+        focused = self.focused
+        if isinstance(focused, ListView):
+            self._set_list_selection(focused, -1, ensure_visible=True)
+        elif isinstance(focused, Tree) and focused.last_line >= 0:
+            focused.move_cursor_to_line(focused.last_line, animate=False)
+
     def action_open_selected(self) -> None:
         """Open the selected tree or directory-list path."""
 
@@ -1471,7 +1593,7 @@ class CompsizerApp(App[None]):
 
         self.model.sort_mode = self.model.sort_mode.toggled()
         self._update_path_label()
-        self._track(self._render_rows())
+        self._schedule_row_render()
         self._track(
             self.manager.set_view(
                 self.model.view_id, self.model.requests_for_missing_results()
@@ -1492,7 +1614,7 @@ class CompsizerApp(App[None]):
                     )
             requests = self.model.requests_for_missing_results()
             self._track(self.manager.set_view(self.model.view_id, requests))
-        self._track(self._render_rows())
+        self._schedule_row_render()
 
     def action_refresh_view(self) -> None:
         """Re-enumerate and rescan the current directory."""

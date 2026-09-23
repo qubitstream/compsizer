@@ -40,10 +40,11 @@ with `./compsizer.py`.
 ## Controls
 
 - `Up`/`Down` or `j`/`k`: move the selection
+- `Home`/`End`: select the first or last row
 - `Enter` or `l`: enter the selected directory
 - `Backspace` or `h`: open the parent directory
 - `Tab`: change pane focus
-- `s`: switch between size and compression-ratio sorting
+- `s`: cycle between size, compression-ratio, and savings sorting
 - `c`: toggle the in-memory result cache
 - `r`: refresh the current directory and rescan its children
 - `?`: show help
@@ -51,7 +52,9 @@ with `./compsizer.py`.
 
 Size sorting uses uncompressed bytes, with the largest directory first.
 Ratio sorting uses `disk usage / uncompressed size`, with the lowest ratio
-first. Pending and error rows remain below rows with known values.
+first. Savings sorting uses `uncompressed size - disk usage`, with the
+largest difference first. Pending and error rows remain below rows with
+known values.
 
 ## Data and limitations
 

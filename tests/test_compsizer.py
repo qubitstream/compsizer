@@ -183,6 +183,35 @@ class SortingTests(unittest.TestCase):
             [record.entry.name for record in ordered], ["best", "poor", "pending"]
         )
 
+    def test_savings_uses_absolute_byte_difference(self) -> None:
+        records = [
+            self.record(
+                "large-modest",
+                0,
+                ScanResult(
+                    Path("/root/large-modest"), ScanState.COMPLETE, 700, 1000, 1000
+                ),
+            ),
+            self.record(
+                "small-good",
+                1,
+                ScanResult(Path("/root/small-good"), ScanState.COMPLETE, 50, 400, 400),
+            ),
+            self.record(
+                "waste",
+                2,
+                ScanResult(Path("/root/waste"), ScanState.COMPLETE, 120, 100, 100),
+            ),
+            self.record("pending", 3, ScanResult.pending(Path("/root/pending"))),
+        ]
+
+        ordered = sort_records(records, SortMode.SAVINGS)
+
+        self.assertEqual(
+            [record.entry.name for record in ordered],
+            ["small-good", "large-modest", "waste", "pending"],
+        )
+
 
 class NavigationTests(unittest.TestCase):
     """Test path normalization and direct directory enumeration."""
@@ -256,7 +285,8 @@ class FakeRunner:
         self.maximum_active = max(self.maximum_active, self.active)
         try:
             await asyncio.sleep(self.delay)
-            return ScanResult(path, ScanState.COMPLETE, 10, 100, 100)
+            uncompressed = 200 if path.name == "beta" else 100
+            return ScanResult(path, ScanState.COMPLETE, 10, uncompressed, uncompressed)
         finally:
             self.active -= 1
 
@@ -283,12 +313,28 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     {record.entry.name for record in app.model.records.values()},
                     {"alpha", "beta"},
                 )
+                items_before = dict(app._row_items)
                 directory_list = app.query_one("#directory-list", ListView)
                 for _ in range(20):
                     if directory_list.index is not None:
                         break
                     await pilot.pause(0.01)
                 self.assertIsNotNone(directory_list.index)
+                await pilot.pause(0.3)
+                self.assertEqual(
+                    [record.entry.name for record in app.model.sorted_records()],
+                    ["beta", "alpha"],
+                )
+                for key, item in items_before.items():
+                    self.assertIs(app._row_items[key], item)
+                await pilot.press("home")
+                await pilot.pause(0.01)
+                self.assertEqual(app.model.selected_path, root / "beta")
+                self.assertEqual(directory_list.index, 0)
+                await pilot.press("end")
+                await pilot.pause(0.01)
+                self.assertEqual(app.model.selected_path, root / "alpha")
+                self.assertEqual(directory_list.index, 1)
                 await pilot.press("enter")
                 await pilot.pause(0.01)
                 self.assertEqual(app.model.current_path, root / "alpha")
@@ -297,6 +343,29 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     {record.entry.name for record in app.model.records.values()},
                 )
                 await pilot.press("backspace")
+
+    async def test_home_and_end_keep_cursor_and_scroll_in_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for index in range(40):
+                (root / f"directory-{index:02d}").mkdir()
+            app = CompsizerApp(root, runner=FakeRunner(delay=1.0))
+
+            async with app.run_test(size=(120, 30)) as pilot:
+                await pilot.pause(0.1)
+                directory_list = app.query_one("#directory-list", ListView)
+                for _ in range(20):
+                    if directory_list.index is not None:
+                        break
+                    await pilot.pause(0.01)
+                await pilot.press("end")
+                await pilot.pause(0.01)
+                self.assertEqual(directory_list.index, 39)
+                self.assertGreater(directory_list.scroll_y, 0)
+                await pilot.press("home")
+                await pilot.pause(0.01)
+                self.assertEqual(directory_list.index, 0)
+                self.assertEqual(directory_list.scroll_y, 0)
 
 
 class ScanManagerTests(unittest.IsolatedAsyncioTestCase):
