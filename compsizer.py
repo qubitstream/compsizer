@@ -380,17 +380,28 @@ def diagnostic_text(value: str, *, limit: int = MAX_DIAGNOSTIC_LENGTH) -> str:
     return f"{normalized[: limit - 1]}…"
 
 
+def _is_empty_report_message(message: str) -> bool:
+    """Return whether one compsize line reports an empty input."""
+
+    normalized = message.strip().casefold()
+    if normalized in {"no files", "no files."}:
+        return True
+    return re.match(r"processed\s+0\s+files\b", normalized) is not None
+
+
 def _is_empty_compsize_report(stdout: str, stderr: str) -> bool:
     """Recognize compsize's normal empty-input response."""
 
-    stdout_message = stdout.strip().casefold()
-    if stdout_message in {"no files", "no files."}:
-        return not stderr.strip()
-    if stdout_message:
-        return False
-    messages = [line.strip().casefold() for line in stderr.splitlines() if line.strip()]
-    return bool(messages) and all(
-        message in {"no files", "no files."} for message in messages
+    stdout_messages = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if stdout_messages:
+        return (
+            len(stdout_messages) == 1
+            and _is_empty_report_message(stdout_messages[0])
+            and not stderr.strip()
+        )
+    stderr_messages = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return bool(stderr_messages) and all(
+        _is_empty_report_message(message) for message in stderr_messages
     )
 
 
@@ -436,9 +447,16 @@ def parse_compsize_output(stdout: str, stderr: str = "") -> ParsedCompsizeReport
         tokens = line.split()
         if not tokens:
             continue
+        if (
+            len(tokens) >= 3
+            and tokens[0].casefold() == "processed"
+            and tokens[2].casefold().startswith("file")
+        ):
+            total = None
+            compression_types = []
+            continue
         if tokens[0].upper() == "TOTAL":
             total = _parse_byte_columns(tokens, line)
-            compression_types = []
             continue
         if len(tokens) < 5 or not tokens[1].endswith("%"):
             continue
@@ -452,8 +470,7 @@ def parse_compsize_output(stdout: str, stderr: str = "") -> ParsedCompsizeReport
 
     if total is None:
         processed_zero = any(
-            line.strip().casefold() in {"processed 0 files.", "processed 0 files"}
-            for line in stdout.splitlines()
+            _is_empty_report_message(line) for line in stdout.splitlines()
         )
         if processed_zero and not stderr.strip():
             return ParsedCompsizeReport(0, 0, 0, empty=True)

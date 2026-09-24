@@ -69,6 +69,31 @@ class ParserTests(unittest.TestCase):
         )
         self.assertAlmostEqual(result.ratio or 0.0, 0.4)
 
+    def test_parses_compression_types_before_a_trailing_total(self) -> None:
+        report = parse_compsize_output(
+            "Processed 2 files, 3 extents.\n"
+            "Type       Perc   Disk Usage   Uncompressed   Referenced\n"
+            "none       100%   100          100            100\n"
+            "zstd       20%    300          900            1100\n"
+            "TOTAL      41%    400          1000           1200\n"
+        )
+
+        self.assertEqual(report.compression_types, ("none", "zstd"))
+        self.assertEqual(report.disk_usage_bytes, 400)
+
+    def test_uses_only_the_last_processed_report(self) -> None:
+        report = parse_compsize_output(
+            "Processed 1 files.\n"
+            "none       100%   10           10             10\n"
+            "TOTAL      100%   10           10             10\n"
+            "Processed 2 files, 3 extents.\n"
+            "zstd       20%    300          900            1100\n"
+            "TOTAL      41%    400          1000           1200\n"
+        )
+
+        self.assertEqual(report.compression_types, ("zstd",))
+        self.assertEqual(report.disk_usage_bytes, 400)
+
     def test_uses_stderr_as_a_warning(self) -> None:
         report = parse_compsize_output(
             "TOTAL 50% 50 100 100\n",
@@ -81,8 +106,20 @@ class ParserTests(unittest.TestCase):
         empty_from_stderr = parse_compsize_output("", "No files.\n")
         empty_from_stdout = parse_compsize_output("No files.\n")
         empty_processed = parse_compsize_output("Processed 0 files.\n")
+        empty_processed_details = parse_compsize_output(
+            "Processed 0 files, 0 extents.\n"
+        )
+        empty_processed_stderr = parse_compsize_output(
+            "", "Processed 0 files, 0 extents.\n"
+        )
 
-        for report in (empty_from_stderr, empty_from_stdout, empty_processed):
+        for report in (
+            empty_from_stderr,
+            empty_from_stdout,
+            empty_processed,
+            empty_processed_details,
+            empty_processed_stderr,
+        ):
             self.assertTrue(report.empty)
             self.assertEqual(report.disk_usage_bytes, 0)
             self.assertEqual(report.uncompressed_bytes, 0)
