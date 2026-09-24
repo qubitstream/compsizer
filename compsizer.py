@@ -207,6 +207,8 @@ class ScanResult:
 
         if (
             not self.is_ntfs
+            or self.disk_usage_bytes is None
+            or self.uncompressed_bytes is None
             or self.ntfs_compressed_files is None
             or self.ntfs_sparse_files is None
         ):
@@ -1074,8 +1076,8 @@ class WindowsScanRunner:
             warning=" ".join(warning_parts) or None,
             error=error,
             is_ntfs=True,
-            ntfs_compressed_files=compressed_files,
-            ntfs_sparse_files=sparse_files,
+            ntfs_compressed_files=compressed_files if statistics_available else None,
+            ntfs_sparse_files=sparse_files if statistics_available else None,
         )
 
     @staticmethod

@@ -1311,6 +1311,25 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             self.assertCountEqual(api.inspected_names, ["readable.bin", "denied.bin"])
             await runner.close()
 
+    async def test_fully_failed_ntfs_scan_does_not_report_zero_file_counts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "denied.bin").write_bytes(b"denied")
+            api = FakeWindowsFileApi("NTFS", {}, {"denied.bin"})
+            runner = WindowsScanRunner(api)
+
+            result = await runner.scan(root)
+
+            self.assertIs(result.state, ScanState.ERROR)
+            self.assertIsNone(result.disk_usage_bytes)
+            self.assertIsNone(result.uncompressed_bytes)
+            self.assertIsNone(result.ntfs_compressed_files)
+            self.assertIsNone(result.ntfs_sparse_files)
+            self.assertIsNone(result.ntfs_summary)
+            await runner.close()
+
     async def test_cancelled_thread_keeps_its_scan_slot_until_it_stops(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
