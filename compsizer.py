@@ -212,11 +212,11 @@ class ScanResult:
 
 @dataclass(frozen=True, slots=True)
 class _CompsizeAttempt:
-    """Keep a scan result with the reason an attempt may be retried."""
+    """Represent a scan result with permission or authentication retry details."""
 
     result: ScanResult
     permission_required: bool = False
-    sudo_failed: bool = False
+    sudo_authentication_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,7 +649,7 @@ class CompsizeRunner:
 
         if self._sudo_enabled:
             attempt = await self._run_scan(path, elevated=True)
-            if not attempt.sudo_failed:
+            if not attempt.sudo_authentication_failed:
                 return attempt.result
             return await self._reauthorize(path)
 
@@ -669,7 +669,7 @@ class CompsizeRunner:
         async with self._authorization_lock:
             if self._sudo_enabled:
                 attempt = await self._run_scan(path, elevated=True)
-                if not attempt.sudo_failed:
+                if not attempt.sudo_authentication_failed:
                     return attempt.result
                 self._sudo_enabled = False
                 self._authorization_declined = False
@@ -689,7 +689,7 @@ class CompsizeRunner:
         async with self._authorization_lock:
             if self._sudo_enabled:
                 attempt = await self._run_scan(path, elevated=True)
-                if not attempt.sudo_failed:
+                if not attempt.sudo_authentication_failed:
                     return attempt.result
                 self._sudo_enabled = False
                 self._authorization_declined = False
@@ -726,7 +726,7 @@ class CompsizeRunner:
             )
 
         attempt = await self._run_scan(path, elevated=True)
-        if attempt.sudo_failed:
+        if attempt.sudo_authentication_failed:
             self._authorization_declined = True
             return await self._fallback_scan(
                 path,
@@ -794,14 +794,16 @@ class CompsizeRunner:
             sudo_path = self._trusted_executable_path(self.sudo_executable)
             executable_path = self._trusted_executable_path(self.executable)
             if sudo_path is None or executable_path is None:
+                missing = []
+                if sudo_path is None:
+                    missing.append(f"sudo executable {self.sudo_executable!r}")
+                if executable_path is None:
+                    missing.append(f"compsize executable {self.executable!r}")
                 message = (
-                    f"Unable to run elevated compsize: {self.sudo_executable!r} "
-                    f"or {self.executable!r} was not found in trusted system "
-                    "directories."
+                    "Unable to start elevated scans; these trusted executables were "
+                    f"not found: {', '.join(missing)}."
                 )
-                return _CompsizeAttempt(
-                    ScanResult.error_result(path, message), sudo_failed=True
-                )
+                return _CompsizeAttempt(ScanResult.error_result(path, message))
             command = [
                 sudo_path,
                 "-n",
@@ -817,24 +819,26 @@ class CompsizeRunner:
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=environment,
             )
         except FileNotFoundError:
+            executable_name = "sudo" if elevated else "compsize"
             message = (
-                f"Unable to run elevated compsize: {self.sudo_executable!r} "
-                "was not found in PATH."
-                if elevated
-                else f"Unable to run {self.executable!r}: executable not found in PATH."
+                f"Unable to start {executable_name} executable {command[0]!r}: "
+                "file not found."
             )
-            return _CompsizeAttempt(
-                ScanResult.error_result(path, message), sudo_failed=elevated
-            )
+            return _CompsizeAttempt(ScanResult.error_result(path, message))
         except OSError as exc:
+            executable_name = "sudo" if elevated else "compsize"
             return _CompsizeAttempt(
-                ScanResult.error_result(path, f"Unable to start compsize: {exc}"),
-                sudo_failed=elevated,
+                ScanResult.error_result(
+                    path,
+                    f"Unable to start {executable_name} executable "
+                    f"{command[0]!r}: {exc}",
+                )
             )
 
         self._processes.add(process)
@@ -849,17 +853,17 @@ class CompsizeRunner:
         stdout = stdout_bytes.decode(errors="replace")
         stderr = stderr_bytes.decode(errors="replace")
         exit_code = process.returncode
-        sudo_failed = (
+        sudo_authentication_failed = (
             elevated and exit_code not in (None, 0) and self._is_sudo_failure(stderr)
         )
-        if sudo_failed:
+        if sudo_authentication_failed:
             return _CompsizeAttempt(
                 ScanResult.error_result(
                     path,
                     diagnostic_text(stderr) or "Sudo could not run compsize.",
                     exit_code=exit_code,
                 ),
-                sudo_failed=True,
+                sudo_authentication_failed=True,
             )
 
         permission_required = self._has_permission_error(stderr)

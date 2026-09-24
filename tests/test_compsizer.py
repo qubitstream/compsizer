@@ -964,6 +964,55 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     CompsizeRunner._trusted_executable_path(os.fspath(external))
                 )
 
+    async def test_sudo_startup_failures_do_not_request_authorization_again(
+        self,
+    ) -> None:
+        for startup_error in (
+            FileNotFoundError("not found"),
+            PermissionError("permission denied"),
+        ):
+            with (
+                self.subTest(error=type(startup_error).__name__),
+                tempfile.TemporaryDirectory() as temporary_directory,
+            ):
+                root = Path(temporary_directory)
+                sudo = root / "sudo"
+                compsize = root / "compsize"
+                self._write_executable(sudo, "exit 0\n")
+                self._write_executable(compsize, "exit 0\n")
+                authorization_calls = 0
+
+                async def authorize(_command: list[str]) -> bool:
+                    nonlocal authorization_calls
+                    authorization_calls += 1
+                    return False
+
+                runner = CompsizeRunner(
+                    "compsize",
+                    sudo_executable="sudo",
+                    authorization_callback=authorize,
+                    fallback_runner=FakeRunner(),
+                )
+                runner._running_as_root = False
+                runner._sudo_enabled = True
+                with (
+                    patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)),
+                    patch(
+                        "asyncio.create_subprocess_exec",
+                        side_effect=startup_error,
+                    ) as spawn,
+                ):
+                    result = await runner.scan(root / "target")
+
+                self.assertIs(result.state, ScanState.ERROR)
+                self.assertIn(os.fspath(sudo), result.error or "")
+                self.assertEqual(authorization_calls, 0)
+                self.assertIs(
+                    spawn.await_args.kwargs["stdin"],
+                    asyncio.subprocess.DEVNULL,
+                )
+                await runner.close()
+
     async def test_missing_executable_becomes_row_error(self) -> None:
         runner = CompsizeRunner("compsize-command-that-does-not-exist")
 
