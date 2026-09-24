@@ -602,6 +602,14 @@ class WindowsFileApi:
         return f"\\\\?\\{absolute_path}"
 
 
+def _scandir_path(path: Path) -> str:
+    """Return a path that supports long-path directory enumeration on Windows."""
+
+    if os.name == "nt":
+        return WindowsFileApi._extended_path(path)
+    return os.fspath(path)
+
+
 def enumerate_directories(path: Path) -> DirectoryListing:
     """Enumerate direct child directories without following symlinks.
 
@@ -612,7 +620,7 @@ def enumerate_directories(path: Path) -> DirectoryListing:
     entries: list[DirectoryEntry] = []
     warnings: list[str] = []
     try:
-        with os.scandir(path) as directory:
+        with os.scandir(_scandir_path(path)) as directory:
             for entry in directory:
                 try:
                     if not entry.is_dir(follow_symlinks=False):
@@ -995,7 +1003,7 @@ class WindowsScanRunner:
         while directories and not cancellation.is_set():
             directory_path = directories.pop()
             try:
-                directory = os.scandir(directory_path)
+                directory = os.scandir(_scandir_path(directory_path))
             except OSError as exc:
                 failed_paths += 1
                 self._add_diagnostic(diagnostics, directory_path, exc)

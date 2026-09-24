@@ -37,6 +37,7 @@ from compsizer import (
     WindowsFileApi,
     WindowsFileMetadata,
     WindowsScanRunner,
+    _scandir_path,
     enumerate_directories,
     normalize_initial_path,
     parse_compsize_output,
@@ -1110,6 +1111,23 @@ class BlockingWindowsFileApi(FakeWindowsFileApi):
 
 class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
     """Test NTFS metric aggregation and filesystem-based scanner selection."""
+
+    def test_scandir_path_uses_extended_path_on_windows(self) -> None:
+        path = Path("C:/long/tree")
+        extended_path = "\\\\?\\C:\\long\\tree"
+
+        with (
+            patch("compsizer.os.name", "nt"),
+            patch.object(
+                WindowsFileApi,
+                "_extended_path",
+                return_value=extended_path,
+            ) as extend_path,
+        ):
+            result = _scandir_path(path)
+
+        self.assertEqual(result, extended_path)
+        extend_path.assert_called_once_with(path)
 
     @staticmethod
     def _metadata(
