@@ -1153,11 +1153,11 @@ class BrowserModel:
         self,
         visible_paths: Iterable[Path] = (),
     ) -> list[ScanRequest]:
-        """Return missing scans, prioritizing visible rows and selection.
+        """Return pending and running scans, prioritizing visible rows.
 
-        All missing current-view rows are returned. Visible rows get
-        priorities ahead of off-screen rows so ranking can still converge
-        across the complete sibling set.
+        Error rows remain visible until a refresh or navigation starts a new
+        view. Running rows stay in the request set so view updates do not
+        cancel their active work.
         """
 
         ordered = self.sorted_records()
@@ -1166,7 +1166,7 @@ class BrowserModel:
         offscreen_start = len(ordered)
         requests: list[ScanRequest] = []
         for index, record in enumerate(ordered):
-            if record.result.state is ScanState.COMPLETE:
+            if record.result.state in {ScanState.COMPLETE, ScanState.ERROR}:
                 continue
             key = path_key(record.entry.path)
             if key == selected_key:

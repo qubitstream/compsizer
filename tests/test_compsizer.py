@@ -387,6 +387,23 @@ class FakeRunner:
         self.closed = True
 
 
+class ErrorRunner:
+    """Count scans that always end in a visible error."""
+
+    def __init__(self) -> None:
+        self.calls: list[Path] = []
+
+    async def scan(self, path: Path) -> ScanResult:
+        """Return one deterministic scan error."""
+
+        self.calls.append(path)
+        await asyncio.sleep(0.01)
+        return ScanResult.error_result(path, "test scan failure")
+
+    async def close(self) -> None:
+        """Stop the fake runner."""
+
+
 class AppTests(unittest.IsolatedAsyncioTestCase):
     """Exercise immediate UI loading with a fake compression runner."""
 
@@ -441,6 +458,39 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     {record.entry.name for record in app.model.records.values()},
                 )
                 await pilot.press("backspace")
+
+    async def test_error_rows_wait_for_refresh_before_retrying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "child"
+            child.mkdir()
+            runner = ErrorRunner()
+            app = CompsizerApp(root, runner=runner)
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                for _ in range(100):
+                    records = tuple(app.model.records.values())
+                    if records and records[0].result.state is ScanState.ERROR:
+                        break
+                    await pilot.pause(0.01)
+                self.assertEqual(runner.calls, [child])
+
+                await pilot.pause(0.1)
+                self.assertEqual(runner.calls, [child])
+
+                await pilot.press("r")
+                for _ in range(100):
+                    records = tuple(app.model.records.values())
+                    if (
+                        len(runner.calls) == 2
+                        and records
+                        and records[0].result.state is ScanState.ERROR
+                    ):
+                        break
+                    await pilot.pause(0.01)
+                self.assertEqual(runner.calls, [child, child])
+                await pilot.pause(0.1)
+                self.assertEqual(runner.calls, [child, child])
 
     async def test_home_and_end_keep_cursor_and_scroll_in_sync(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
