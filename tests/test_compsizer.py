@@ -430,6 +430,24 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(model.state_counts[ScanState.PENDING], 0)
         self.assertEqual(model.state_counts[ScanState.COMPLETE], 2)
 
+    def test_refresh_invalidates_current_path_and_child_results(self) -> None:
+        root = Path("/root/current")
+        child = root / "child"
+        cache = ResultCache()
+        cache.put(ScanResult(root, ScanState.COMPLETE, 10, 20, 20))
+        cache.put(ScanResult(child, ScanState.COMPLETE, 5, 10, 10))
+        model = BrowserModel(root, cache)
+        view_id = model.begin_view(root)
+        model.set_listing(
+            view_id,
+            DirectoryListing(root, (DirectoryEntry(child, child.name),)),
+        )
+
+        model.begin_view(root, refresh=True)
+
+        self.assertIsNone(cache.get(root))
+        self.assertIsNone(cache.get(child))
+
 
 class FakeRunner:
     """Small asynchronous runner used to test bounded scheduling."""
@@ -570,6 +588,77 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.1)
                 self.assertEqual(runner.calls, [child, child])
 
+    async def test_refresh_reloads_tree_and_invalidates_current_path_cache(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "child"
+            child.mkdir()
+            old_child = child / "old"
+            old_child.mkdir()
+            app = CompsizerApp(root, runner=FakeRunner())
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                tree = app.query_one("#directory-tree", Tree)
+                for _ in range(100):
+                    tree_child = next(
+                        (node for node in tree.root.children if node.data == child),
+                        None,
+                    )
+                    if app.cache.get(child) is not None and tree_child is not None:
+                        break
+                    await pilot.pause(0.01)
+                self.assertIsNotNone(app.cache.get(child))
+                self.assertIsNotNone(tree_child)
+                if tree_child is None:
+                    self.fail("The directory tree did not load the child path.")
+
+                tree_child.expand()
+                for _ in range(100):
+                    if any(node.data == old_child for node in tree_child.children):
+                        break
+                    await pilot.pause(0.01)
+                self.assertIn(old_child, [node.data for node in tree_child.children])
+
+                await pilot.press("enter")
+                for _ in range(100):
+                    if app.model.current_path == child:
+                        break
+                    await pilot.pause(0.01)
+                self.assertEqual(app.model.current_path, child)
+
+                new_child = child / "new"
+                new_child.mkdir()
+                await pilot.press("r")
+                self.assertIsNone(app.cache.get(child))
+                for _ in range(100):
+                    names = {record.entry.name for record in app.model.records.values()}
+                    tree_names = {node.data for node in tree_child.children}
+                    if "new" in names and new_child in tree_names:
+                        break
+                    await pilot.pause(0.01)
+
+                self.assertEqual(
+                    {record.entry.name for record in app.model.records.values()},
+                    {"new", "old"},
+                )
+                self.assertIn(new_child, [node.data for node in tree_child.children])
+
+                app._invalidate_tree_subtree(child)
+                with (
+                    patch(
+                        "compsizer.enumerate_directories",
+                        return_value=DirectoryListing(child, error="temporary failure"),
+                    ),
+                    self.assertLogs("compsizer", level="WARNING"),
+                ):
+                    await app._load_tree_children(tree_child)
+                self.assertEqual(
+                    {node.data for node in tree_child.children},
+                    {old_child, new_child},
+                )
+
     async def test_large_directory_rows_are_paginated_and_browsable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -580,11 +669,35 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
             async with app.run_test(size=(120, 30)) as pilot:
                 directory_list = app.query_one("#directory-list", ListView)
                 tree = app.query_one("#directory-tree", Tree)
+
+                async def wait_for_page(
+                    page_index: int,
+                    selected_path: Path,
+                    row_count: int,
+                ) -> None:
+                    for _ in range(200):
+                        visible_names = [
+                            row.record.entry.name for row in app._row_widgets.values()
+                        ]
+                        if (
+                            app._page_index == page_index
+                            and app.model.selected_path == selected_path
+                            and len(directory_list.children) == row_count
+                            and visible_names
+                            and visible_names[0] == selected_path.name
+                        ):
+                            return
+                        await pilot.pause(0.01)
+                    self.fail(
+                        f"Directory page {page_index + 1} did not finish loading."
+                    )
+
                 for _ in range(100):
                     if (
                         len(app.model.records) == 205
                         and len(directory_list.children) == DIRECTORY_PAGE_SIZE
                         and len(tree.root.children) == TREE_CHILD_LIMIT + 1
+                        and "page 1/3" in app.query_one("#status").render().plain
                     ):
                         break
                     await pilot.pause(0.01)
@@ -595,29 +708,34 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("page 1/3", app.query_one("#status").render().plain)
 
                 await pilot.press("pagedown")
-                await pilot.pause(0.05)
+                await wait_for_page(1, root / "child-100", DIRECTORY_PAGE_SIZE)
                 self.assertEqual(app._page_index, 1)
-                self.assertEqual(len(directory_list.children), DIRECTORY_PAGE_SIZE)
                 self.assertEqual(app.model.selected_path, root / "child-100")
 
                 await pilot.press("pagedown")
-                await pilot.pause(0.05)
+                await wait_for_page(2, root / "child-200", 5)
                 self.assertEqual(app._page_index, 2)
-                self.assertEqual(len(directory_list.children), 5)
                 self.assertEqual(app.model.selected_path, root / "child-200")
 
                 await pilot.press("pageup")
-                await pilot.pause(0.05)
+                await wait_for_page(1, root / "child-100", DIRECTORY_PAGE_SIZE)
                 self.assertEqual(app._page_index, 1)
                 self.assertEqual(app.model.selected_path, root / "child-100")
 
                 await pilot.press("pagedown")
-                await pilot.pause(0.05)
+                await wait_for_page(2, root / "child-200", 5)
                 self.assertEqual(app._page_index, 2)
                 self.assertEqual(app.model.selected_path, root / "child-200")
 
                 await pilot.press("enter")
-                await pilot.pause(0.05)
+                for _ in range(200):
+                    if (
+                        app.model.current_path == root / "child-200"
+                        and not app.model.records
+                        and "page 1/1" in app.query_one("#status").render().plain
+                    ):
+                        break
+                    await pilot.pause(0.01)
                 self.assertEqual(app.model.current_path, root / "child-200")
 
     async def test_home_and_end_keep_cursor_and_scroll_in_sync(self) -> None:

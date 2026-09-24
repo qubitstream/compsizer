@@ -92,7 +92,8 @@ for numeric sorts; name sorting includes every row in name order.
   shared extents, and extent waste can make sibling measurements overlap.
 - The in-memory cache lasts for one process. It is not persistent and has no
   automatic filesystem-change invalidation.
-- Refresh is explicit. It invalidates current child results and starts new
+- Refresh is explicit. It invalidates the current directory and its child
+  results, refreshes the corresponding tree entries, and starts new
   measurements.
 - Partial `SIGUSR1` progress is not enabled yet. Rows update when their
   individual scans finish.

@@ -1070,14 +1070,20 @@ class BrowserModel:
         self._selection_by_directory: dict[str, Path] = {}
 
     def begin_view(self, path: Path, *, refresh: bool = False) -> int:
-        """Start a new view before any filesystem or subprocess work."""
+        """Start a new view before any filesystem or subprocess work.
+
+        A refresh invalidates cached statistics for ``path`` and its current
+        direct child directories.
+        """
 
         if self.selected_path is not None:
             self._selection_by_directory[path_key(self.current_path)] = (
                 self.selected_path
             )
         if refresh:
-            self.cache.invalidate(record.entry.path for record in self.records.values())
+            self.cache.invalidate(
+                [path, *(record.entry.path for record in self.records.values())]
+            )
         self.current_path = path
         self.view_id += 1
         self.records = {}
@@ -1843,7 +1849,8 @@ class CompsizerApp(App[None]):
         self._view_load_task: asyncio.Task[Any] | None = None
         self._tree_reveal_task: asyncio.Task[Any] | None = None
         self._tree_loaded: set[str] = set()
-        self._tree_loading: set[str] = set()
+        self._tree_loading: dict[str, int] = {}
+        self._tree_generations: dict[str, int] = {}
         self._row_items: dict[str, ListItem] = {}
         self._row_widgets: dict[str, DirectoryRow] = {}
         self._row_render_lock = asyncio.Lock()
@@ -1967,7 +1974,9 @@ class CompsizerApp(App[None]):
         self._view_load_task = self._track(self._load_view(view_id, path))
         if self._tree_reveal_task is not None and not self._tree_reveal_task.done():
             self._tree_reveal_task.cancel()
-        self._tree_reveal_task = self._track(self._reveal_tree_path(path))
+        self._tree_reveal_task = self._track(
+            self._reveal_tree_path(path, refresh=refresh)
+        )
         self._schedule_row_render()
 
     async def _load_view(self, view_id: int, path: Path) -> None:
@@ -2332,6 +2341,37 @@ class CompsizerApp(App[None]):
 
         return Text(path.name or str(path), no_wrap=True, overflow="ellipsis")
 
+    def _invalidate_tree_subtree(self, path: Path) -> None:
+        """Forget loaded tree nodes at or below ``path``."""
+
+        root = Path(path_key(path))
+        keys = (
+            set(self._tree_loaded)
+            | set(self._tree_loading)
+            | set(self._tree_generations)
+        )
+        for key in keys:
+            try:
+                Path(key).relative_to(root)
+            except ValueError:
+                continue
+            self._tree_loaded.discard(key)
+            self._tree_generations[key] = self._tree_generations.get(key, 0) + 1
+            self._tree_loading.pop(key, None)
+
+    def _invalidate_all_tree_nodes(self) -> None:
+        """Invalidate all loaded or active tree enumerations."""
+
+        keys = (
+            set(self._tree_loaded)
+            | set(self._tree_loading)
+            | set(self._tree_generations)
+        )
+        for key in keys:
+            self._tree_generations[key] = self._tree_generations.get(key, 0) + 1
+        self._tree_loaded.clear()
+        self._tree_loading.clear()
+
     async def _load_tree_children(self, node: TreeNode[Any]) -> None:
         """Load one tree node's direct children without recursion."""
 
@@ -2343,10 +2383,20 @@ class CompsizerApp(App[None]):
         key = path_key(path)
         if key in self._tree_loaded or key in self._tree_loading:
             return
-        self._tree_loading.add(key)
+        generation = self._tree_generations.get(key, 0)
+        self._tree_loading[key] = generation
         try:
             listing = await asyncio.to_thread(enumerate_directories, path)
-            if self._shutting_down or not self._ui_ready:
+            if (
+                self._shutting_down
+                or not self._ui_ready
+                or self._tree_generations.get(key, 0) != generation
+            ):
+                return
+            if listing.error is not None:
+                LOGGER.warning(
+                    "Unable to load tree children for %s: %s", path, listing.error
+                )
                 return
             node.remove_children()
             entries = listing.entries[:TREE_CHILD_LIMIT]
@@ -2366,10 +2416,11 @@ class CompsizerApp(App[None]):
             node.allow_expand = bool(listing.entries)
             self._tree_loaded.add(key)
         finally:
-            self._tree_loading.discard(key)
+            if self._tree_loading.get(key) == generation:
+                self._tree_loading.pop(key, None)
 
-    async def _reveal_tree_path(self, path: Path) -> None:
-        """Reveal the current path in the lazily loaded directory tree."""
+    async def _reveal_tree_path(self, path: Path, *, refresh: bool = False) -> None:
+        """Reveal a path and optionally reload its tree children."""
 
         if self._shutting_down or not self._ui_ready:
             return
@@ -2386,10 +2437,9 @@ class CompsizerApp(App[None]):
         except ValueError:
             root.set_label(self._tree_label(path))
             root.data = path
+            self._invalidate_all_tree_nodes()
             root.remove_children()
             root.allow_expand = True
-            self._tree_loaded.clear()
-            self._tree_loading.clear()
             tree.move_cursor(root)
             await self._load_tree_children(root)
             return
@@ -2411,9 +2461,19 @@ class CompsizerApp(App[None]):
                 None,
             )
             if child is None:
+                if refresh:
+                    parent_path = node.data
+                    if isinstance(parent_path, Path):
+                        self._invalidate_tree_subtree(parent_path)
+                        node.allow_expand = True
+                        await self._load_tree_children(node)
                 return
             node.expand()
             node = child
+        if refresh:
+            self._invalidate_tree_subtree(path)
+            node.allow_expand = True
+            await self._load_tree_children(node)
         tree.move_cursor(node)
 
     def _focused_tree_path(self) -> Path | None:
