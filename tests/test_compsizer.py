@@ -1401,6 +1401,33 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         path.write_text(f"#!/bin/sh\n{content}", encoding="utf-8")
         path.chmod(0o755)
 
+    def test_compsize_runner_constructs_without_effective_uid_api(self) -> None:
+        with patch.object(os, "geteuid", None, create=True):
+            runner = CompsizeRunner()
+
+        self.assertFalse(runner._running_as_root)
+
+    def test_trusted_executable_lookup_splits_platform_path_separator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            trusted = root / "trusted"
+            trusted.mkdir()
+            executable = trusted / "compsize"
+            self._write_executable(executable, "exit 0\n")
+            other = root / "other"
+            other.mkdir()
+
+            with (
+                patch("compsizer.os.pathsep", ";"),
+                patch(
+                    "compsizer.SYSTEM_EXECUTABLE_PATH",
+                    f"{trusted};{other}",
+                ),
+            ):
+                resolved = CompsizeRunner._trusted_executable_path("compsize")
+
+            self.assertEqual(resolved, os.fspath(executable.resolve()))
+
     def test_trusted_executable_lookup_rejects_external_paths_and_symlinks(
         self,
     ) -> None:

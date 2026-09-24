@@ -48,7 +48,19 @@ TREE_CHILD_LIMIT = 100
 MAX_DIAGNOSTIC_LENGTH = 500
 ROW_REFRESH_DELAY = 0.02
 # Do not resolve elevated commands through the user's environment PATH.
-SYSTEM_EXECUTABLE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+SYSTEM_EXECUTABLE_DIRECTORIES: tuple[str, ...] = (
+    (
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    )
+    if os.name != "nt"
+    else ()
+)
+SYSTEM_EXECUTABLE_PATH = os.pathsep.join(SYSTEM_EXECUTABLE_DIRECTORIES)
 BAR_STYLE = "green"
 NAME_COLUMN_WIDTH = 26
 RATIO_COLUMN_WIDTH = 14
@@ -1123,7 +1135,8 @@ class CompsizeRunner:
             fallback_runner if fallback_runner is not None else DuRunner()
         )
         self._processes: set[asyncio.subprocess.Process] = set()
-        self._running_as_root: bool = os.geteuid() == 0
+        effective_uid = getattr(os, "geteuid", None)
+        self._running_as_root: bool = callable(effective_uid) and effective_uid() == 0
         self._sudo_enabled: bool = False
         self._authorization_declined: bool = False
         self._authorization_lock: asyncio.Lock = asyncio.Lock()
@@ -1252,6 +1265,8 @@ class CompsizeRunner:
     def _trusted_executable_path(executable: str) -> str | None:
         """Resolve an elevated command from system paths, not a user PATH."""
 
+        if not SYSTEM_EXECUTABLE_PATH:
+            return None
         candidate = shutil.which(executable, path=SYSTEM_EXECUTABLE_PATH)
         if candidate is None:
             return None
