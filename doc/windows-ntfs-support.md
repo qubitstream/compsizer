@@ -1,15 +1,12 @@
 # Windows and NTFS support
 
-**Status:** Design proposal
+**Status:** Implemented; Windows validation and benchmarking pending
 
 ## Purpose
 
-Add Windows support to Compsizer. On NTFS volumes, the app should report useful
-file-compression size data while it browses directories. Keep the existing
-Btrfs workflow available on Linux.
-
-This is a feature design, not a statement about current behavior. The current
-app supports Btrfs scans through `compsize` and GNU `du` estimates on Linux.
+Add Windows support to Compsizer. On NTFS volumes, the app reports logical and
+allocated sizes while it browses directories. The existing Btrfs workflow
+remains available on Linux.
 
 ## Goals
 
@@ -28,15 +25,17 @@ app supports Btrfs scans through `compsize` and GNU `du` estimates on Linux.
 - Keep the single-script launch workflow and PEP 723 dependency metadata.
 - Do not add a runtime dependency for Windows support without approval.
 
-## Proposed behavior
+## Behavior
 
-Select a scanner for the filesystem that contains each path being scanned.
-Do not select a scanner only from the initial path; a browsed directory can be
-on a different mounted volume.
+On Windows, select a scanner for the filesystem that contains each path being
+scanned. Do not select a scanner only from the initial path; a browsed directory
+can be on a different mounted volume.
 
 - On Linux Btrfs, use the existing `compsize` backend.
-- On Windows NTFS, use read-only native Windows facilities to collect file
-  compression and size data, then aggregate results for each directory row.
+- On Windows NTFS, use read-only Windows APIs to collect file attributes,
+  identities, and size data, then aggregate results for each directory row.
+- Keep directory mount points browsable, but do not cross them during a scan
+  of their parent. When a user opens one, scan it using its mounted volume.
 - On other Windows filesystems, allow directory browsing without size
   measurements. Do not display NTFS compression statistics for them.
 - Do not change file compression state. Do not require an elevated Windows
@@ -49,30 +48,36 @@ claiming an algorithm breakdown that the scanner does not provide.
 
 ## Measurement requirements
 
-Windows exposes more than one relevant size. The scanner must define the
-meaning of each value before it displays directory totals:
+Windows exposes more than one relevant size. The scanner uses these values:
 
-- Logical file size is the size visible to applications.
-- Stored or allocated size is the disk-space measure used for the NTFS view.
-- Compression state and sparse-file state must be considered separately.
+- `FILE_STANDARD_INFO.EndOfFile` is the logical size visible to applications.
+- `FILE_STANDARD_INFO.AllocationSize` is the allocated-size measure shown for
+  NTFS. It provides one metric for compressed, uncompressed, and sparse files.
+- `FILE_BASIC_INFO.FileAttributes` identifies compressed, sparse, and reparse
+  points. The UI keeps compression and sparsity distinct.
+- `FILE_ID_INFO` identifies hard-linked files so each file is counted once in
+  a scanned tree.
 
-`GetCompressedFileSizeW` is a candidate API. Microsoft documents that it
-returns the compressed size for compressed files and the sparse size for
-sparse files. The scanner must not treat a sparse file as compressed based
-only on a smaller stored-size value. It must also validate how to measure
-uncompressed files so that directory totals use consistent semantics.
+The implementation uses `GetFileInformationByHandleEx` with read-attributes
+access. It does not open or read file contents. `GetCompressedFileSizeW` is
+not used because its documented result is the compressed or sparse size for
+those files, but the logical file size for ordinary uncompressed files. Those
+values would not give consistent allocated-size totals.
 
 Count a hard-linked file once within each scanned tree. Do not recurse through
-directory reparse points. This prevents cycles and scans outside the selected
-tree. Separate directory scans can overlap if the same file is linked into
+directory reparse points or follow file reparse points found below the scan
+root. A directory mount point remains navigable as its own location; its parent
+scan does not cross it, and a scan started at the mount point uses its mounted
+volume. Separate directory scans can overlap if the same file is linked into
 more than one tree.
 
-Prefer an OS-native recursive command when it provides the required size and
-compression data with clear semantics. If no suitable read-only command does
-this, use Windows filesystem APIs in a metadata-only traversal; do not read
-file contents to calculate sizes. Benchmark the chosen approach. `compact` can
-report compression state, but its compression and uncompression options change
-files; do not use those options for scanning.
+No suitable read-only Windows command has been identified that provides the
+required combined per-file compression, sparse, identity, and allocated-size
+data as a recursive report. The implementation therefore uses a metadata-only
+API traversal. `compact` can report compression state, but its compression and
+uncompression options change files; do not use those options for scanning.
+Benchmark the selected traversal on NTFS before treating its performance as
+validated.
 
 ## Design constraints
 
@@ -107,25 +112,29 @@ files; do not use those options for scanning.
 - Linux Btrfs behavior and its existing tests remain intact.
 - Tests cover NTFS compressed, uncompressed, sparse, inaccessible, hard-link,
   and reparse-point cases. Run the Windows-specific checks on Windows.
+- Benchmark the Windows traversal on a large NTFS directory tree.
 
 ## Work plan
 
-1. Audit Windows startup, terminal, path, and subprocess assumptions. Confirm
-   the size APIs and accounting rules with a small NTFS prototype.
-2. Implement the NTFS scanner and focused tests.
-3. Select the scanner by the filesystem of each scanned path and update the
-   UI labels and help text.
-4. Run the existing Linux checks and the Windows-specific test suite.
+1. Audit Windows startup and select the scanner for each scanned path. Done in
+   the implementation.
+2. Implement a metadata-only NTFS scanner and focused tests. Done.
+3. Add filesystem-specific UI labels and help text. Done.
+4. Run Linux checks. Done. Run Windows integration checks from `cmd.exe` and
+   benchmark the scanner on NTFS before release.
 
-## Remaining implementation questions
+## Validation still needed
 
-- Which native Windows tool or API gives the best combination of performance
-  and the required per-file compression and size metrics?
-- What are the consistent stored-size semantics for compressed,
-  uncompressed, and sparse files?
+- Confirm the API results for compressed, uncompressed, sparse, and
+  hard-linked files on Windows 10 or newer.
+- Confirm interactive launch and navigation from standard `cmd.exe`.
+- Record NTFS scan timing and memory use for a large directory tree.
 
 ## References
 
 - [GetCompressedFileSizeW function](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getcompressedfilesizew)
+- [FILE_STANDARD_INFO structure](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_standard_info)
+- [FILE_ID_INFO structure](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_info)
+- [GetFileInformationByHandleEx function](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfileinformationbyhandleex)
 - [File attribute constants](https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants)
 - [The `compact` command](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/compact)

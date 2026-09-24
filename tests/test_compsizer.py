@@ -2,10 +2,11 @@ import asyncio
 import os
 import shlex
 import tempfile
+import threading
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from textual.widgets import ListView, Tree
 
@@ -33,6 +34,9 @@ from compsizer import (
     ScanResult,
     ScanState,
     SortMode,
+    WindowsFileApi,
+    WindowsFileMetadata,
+    WindowsScanRunner,
     enumerate_directories,
     normalize_initial_path,
     parse_compsize_output,
@@ -417,6 +421,29 @@ class NavigationTests(unittest.TestCase):
             )
             self.assertTrue(
                 all(entry.kind is EntryKind.DIRECTORY for entry in listing.entries)
+            )
+
+    def test_windows_enumeration_keeps_volume_mount_directories_browsable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            real_directory = MagicMock()
+            real_directory.name = "real"
+            real_directory.is_dir.return_value = True
+            mounted_volume = MagicMock()
+            mounted_volume.name = "mounted-volume"
+            mounted_volume.is_dir.return_value = True
+            scanner = MagicMock()
+            scanner.__enter__.return_value = scanner
+            scanner.__exit__.return_value = None
+            scanner.__iter__.return_value = iter((real_directory, mounted_volume))
+
+            with patch("compsizer.os.scandir", return_value=scanner):
+                listing = enumerate_directories(root)
+
+            self.assertEqual(
+                [entry.name for entry in listing.entries], ["mounted-volume", "real"]
             )
 
     def test_filesystem_detection_uses_the_deepest_mount_and_decodes_paths(
@@ -998,6 +1025,333 @@ class ScanManagerTests(unittest.IsolatedAsyncioTestCase):
         await manager.close()
 
         self.assertEqual(completed, [first, second])
+
+
+class FakeWindowsFileApi:
+    """Provide deterministic volume and metadata results for Windows scans."""
+
+    def __init__(
+        self,
+        filesystem: str,
+        metadata_by_name: dict[str, WindowsFileMetadata],
+        inaccessible_names: set[str] | None = None,
+    ) -> None:
+        self.filesystem = filesystem
+        self.metadata_by_name = metadata_by_name
+        self.inaccessible_names = inaccessible_names or set()
+        self.inspected_names: list[str] = []
+
+    def filesystem_type(self, path: Path) -> str:
+        """Return the configured filesystem name."""
+
+        return self.filesystem
+
+    def inspect_path(self, path: Path) -> WindowsFileMetadata:
+        """Return configured metadata or emulate an access denial."""
+
+        if path.name not in self.metadata_by_name and path.is_dir():
+            return WindowsFileMetadata(
+                file_identity=None,
+                logical_size=0,
+                allocated_size=0,
+                is_directory=True,
+                is_reparse_point=False,
+                is_compressed=False,
+                is_sparse=False,
+            )
+        self.inspected_names.append(path.name)
+        if path.name in self.inaccessible_names:
+            raise PermissionError(f"Access denied: {path.name}")
+        return self.metadata_by_name[path.name]
+
+
+class BlockingWindowsFileApi(FakeWindowsFileApi):
+    """Hold metadata calls so cancellation and worker limits can be checked."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "NTFS",
+            {
+                "payload.bin": WindowsFileMetadata(
+                    file_identity=(3, b"payload-id"),
+                    logical_size=10,
+                    allocated_size=8,
+                    is_directory=False,
+                    is_reparse_point=False,
+                    is_compressed=False,
+                    is_sparse=False,
+                )
+            },
+        )
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+        self.inspect_count = 0
+
+    def inspect_path(self, path: Path) -> WindowsFileMetadata:
+        """Wait for the test to release one file metadata request."""
+
+        if path.is_dir():
+            return WindowsFileMetadata(
+                file_identity=None,
+                logical_size=0,
+                allocated_size=0,
+                is_directory=True,
+                is_reparse_point=False,
+                is_compressed=False,
+                is_sparse=False,
+            )
+        with self._lock:
+            self.inspect_count += 1
+        self.started.set()
+        self.release.wait(timeout=2)
+        return self.metadata_by_name[path.name]
+
+
+class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
+    """Test NTFS metric aggregation and filesystem-based scanner selection."""
+
+    @staticmethod
+    def _metadata(
+        identity: tuple[int, bytes] | None,
+        logical: int = 0,
+        allocated: int = 0,
+        *,
+        directory: bool = False,
+        reparse: bool = False,
+        compressed: bool = False,
+        sparse: bool = False,
+    ) -> WindowsFileMetadata:
+        """Build one fake file-information record."""
+
+        return WindowsFileMetadata(
+            file_identity=identity,
+            logical_size=logical,
+            allocated_size=allocated,
+            is_directory=directory,
+            is_reparse_point=reparse,
+            is_compressed=compressed,
+            is_sparse=sparse,
+        )
+
+    async def test_ntfs_scan_reports_size_compression_and_sparse_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            nested = root / "nested"
+            nested.mkdir()
+            junction = root / "junction"
+            junction.mkdir()
+            for path in (
+                root / "compressed.bin",
+                root / "compressed-hardlink.bin",
+                root / "plain.bin",
+                root / "sparse.bin",
+                nested / "nested.bin",
+                junction / "must-not-scan.bin",
+            ):
+                path.write_bytes(b"metadata fixture")
+
+            shared_identity = (1, b"compressed-file-id")
+            metadata = {
+                "compressed.bin": self._metadata(
+                    shared_identity,
+                    1000,
+                    300,
+                    compressed=True,
+                ),
+                "compressed-hardlink.bin": self._metadata(
+                    shared_identity,
+                    1000,
+                    300,
+                    compressed=True,
+                ),
+                "plain.bin": self._metadata((1, b"plain-file-id"), 500, 512),
+                "sparse.bin": self._metadata(
+                    (1, b"sparse-file-id"),
+                    10000,
+                    4000,
+                    sparse=True,
+                ),
+                "nested": self._metadata(
+                    None,
+                    directory=True,
+                ),
+                "nested.bin": self._metadata((1, b"nested-file-id"), 200, 256),
+                "junction": self._metadata(
+                    None,
+                    directory=True,
+                    reparse=True,
+                ),
+                "must-not-scan.bin": self._metadata((1, b"outside-file-id"), 900, 1024),
+            }
+            api = FakeWindowsFileApi("NTFS", metadata)
+            runner = WindowsScanRunner(api)
+
+            result = await runner.scan(root)
+
+            self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertEqual(result.uncompressed_bytes, 11700)
+            self.assertEqual(result.disk_usage_bytes, 5068)
+            self.assertTrue(result.is_ntfs)
+            self.assertEqual(result.ntfs_compressed_files, 1)
+            self.assertEqual(result.ntfs_sparse_files, 1)
+            self.assertAlmostEqual(result.ratio or 0.0, 5068 / 11700)
+            self.assertIn("Skipped 1 reparse point", result.warning or "")
+            self.assertNotIn("must-not-scan.bin", api.inspected_names)
+
+            record = DirectoryRecord(DirectoryEntry(root, root.name), result, 0)
+            row = DirectoryRow(record, BarScales.from_records([record]))
+            self.assertIn("C", row.render().plain)
+            self.assertIn("S", row.render().plain)
+            self.assertIn("NTFS-compressed files: 1", str(row.tooltip))
+
+            app = CompsizerApp(root, runner=runner)
+            self.assertIn("Stored/Logical", app._column_header())
+            self.assertIn("Logical Size", app._column_header())
+            await runner.close()
+
+    async def test_non_ntfs_volume_is_browsable_without_scan_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "child"
+            child.mkdir()
+            api = FakeWindowsFileApi("exFAT", {})
+            runner = WindowsScanRunner(api)
+
+            result = await runner.scan(child)
+
+            self.assertIs(result.state, ScanState.UNAVAILABLE)
+            self.assertIsNone(result.disk_usage_bytes)
+            self.assertIn("exFAT", result.warning or "")
+            self.assertEqual(api.inspected_names, [])
+
+            model = BrowserModel(root, ResultCache())
+            view_id = model.begin_view(root)
+            model.set_listing(
+                view_id,
+                DirectoryListing(root, (DirectoryEntry(child, child.name),)),
+            )
+            model.apply_scan_update(ScanJob(1, child, view_id, 0), result)
+            self.assertEqual(model.state_counts[ScanState.UNAVAILABLE], 1)
+            self.assertEqual(model.requests_for_missing_results(), [])
+
+            record = DirectoryRecord(DirectoryEntry(child, child.name), result, 0)
+            row = DirectoryRow(record, BarScales.from_records([record]))
+            self.assertIn("—", row.render().plain)
+            await runner.close()
+
+    async def test_opened_volume_mount_root_is_scanned_on_its_own_volume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mount = root / "mounted-volume"
+            mount.mkdir()
+            (mount / "payload.bin").write_bytes(b"outside tree")
+            api = FakeWindowsFileApi(
+                "NTFS",
+                {
+                    "mounted-volume": self._metadata(
+                        None,
+                        directory=True,
+                        reparse=True,
+                    ),
+                    "payload.bin": self._metadata((4, b"payload-id"), 12, 8),
+                },
+            )
+            runner = WindowsScanRunner(api)
+
+            result = await runner.scan(mount)
+
+            self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertEqual(result.uncompressed_bytes, 12)
+            self.assertEqual(result.disk_usage_bytes, 8)
+            self.assertEqual(api.inspected_names, ["mounted-volume", "payload.bin"])
+            await runner.close()
+
+    async def test_ntfs_permission_errors_keep_partial_totals_and_continue(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "readable.bin").write_bytes(b"readable")
+            (root / "denied.bin").write_bytes(b"denied")
+            api = FakeWindowsFileApi(
+                "NTFS",
+                {
+                    "readable.bin": self._metadata((2, b"readable-id"), 80, 64),
+                },
+                {"denied.bin"},
+            )
+            runner = WindowsScanRunner(api)
+
+            result = await runner.scan(root)
+
+            self.assertIs(result.state, ScanState.ERROR)
+            self.assertTrue(result.has_statistics)
+            self.assertEqual(result.disk_usage_bytes, 64)
+            self.assertEqual(result.uncompressed_bytes, 80)
+            self.assertIn("denied.bin", result.error or "")
+            self.assertCountEqual(api.inspected_names, ["readable.bin", "denied.bin"])
+            await runner.close()
+
+    async def test_cancelled_thread_keeps_its_scan_slot_until_it_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            first_path = root / "first"
+            second_path = root / "second"
+            first_path.mkdir()
+            second_path.mkdir()
+            (first_path / "payload.bin").write_bytes(b"first")
+            (second_path / "payload.bin").write_bytes(b"second")
+            api = BlockingWindowsFileApi()
+            runner = WindowsScanRunner(api, concurrency=1)
+            first_scan = asyncio.create_task(runner.scan(first_path))
+            second_scan: asyncio.Task[ScanResult] | None = None
+
+            try:
+                self.assertTrue(await asyncio.to_thread(api.started.wait, 1))
+                first_scan.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first_scan
+
+                second_scan = asyncio.create_task(runner.scan(second_path))
+                await asyncio.sleep(0.05)
+                self.assertEqual(api.inspect_count, 1)
+
+                api.release.set()
+                result = await asyncio.wait_for(second_scan, timeout=1)
+                self.assertIs(result.state, ScanState.COMPLETE)
+                self.assertEqual(api.inspect_count, 2)
+            finally:
+                api.release.set()
+                for task in (first_scan, second_scan):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    first_scan,
+                    *(task for task in (second_scan,) if task is not None),
+                    return_exceptions=True,
+                )
+                await runner.close()
+
+
+@unittest.skipUnless(os.name == "nt", "Windows API integration test")
+class WindowsApiTests(unittest.TestCase):
+    """Smoke-test the native metadata wrapper on an NTFS volume."""
+
+    def test_native_api_reads_ntfs_file_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            file_path = root / "metadata-only.txt"
+            file_path.write_bytes(b"metadata")
+            file_api = WindowsFileApi()
+            if file_api.filesystem_type(root).casefold() != "ntfs":
+                self.skipTest("The temporary directory is not on NTFS.")
+
+            metadata = file_api.inspect_path(file_path)
+
+            self.assertIsNotNone(metadata.file_identity)
+            self.assertEqual(metadata.logical_size, len(b"metadata"))
+            self.assertGreaterEqual(metadata.allocated_size, 0)
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):

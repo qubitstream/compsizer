@@ -6,18 +6,20 @@
 # ]
 # ///
 
-"""Browse Btrfs compression statistics in a terminal user interface."""
+"""Browse directories and filesystem size statistics in a terminal UI."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import heapq
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -49,8 +51,23 @@ ROW_REFRESH_DELAY = 0.02
 SYSTEM_EXECUTABLE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 BAR_STYLE = "green"
 NAME_COLUMN_WIDTH = 26
-RATIO_COLUMN_WIDTH = 11
+RATIO_COLUMN_WIDTH = 14
 SIZE_COLUMN_WIDTH = 13
+
+FILE_ATTRIBUTE_DIRECTORY = 0x0010
+FILE_ATTRIBUTE_SPARSE_FILE = 0x0200
+FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+FILE_ATTRIBUTE_COMPRESSED = 0x0800
+FILE_READ_ATTRIBUTES = 0x0080
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+OPEN_EXISTING = 3
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+FILE_INFO_CLASS_BASIC = 0
+FILE_INFO_CLASS_STANDARD = 1
+FILE_INFO_CLASS_ID = 18
 
 
 class InvalidInitialPathError(ValueError):
@@ -64,6 +81,7 @@ class ScanState(Enum):
     RUNNING = "running"
     COMPLETE = "complete"
     ERROR = "error"
+    UNAVAILABLE = "unavailable"
 
 
 class SortMode(Enum):
@@ -133,10 +151,13 @@ class ScanResult:
     error: str | None = None
     exit_code: int | None = None
     is_estimate: bool = False
+    is_ntfs: bool = False
+    ntfs_compressed_files: int | None = None
+    ntfs_sparse_files: int | None = None
 
     @property
     def ratio(self) -> float | None:
-        """Return the exact compsize disk-usage ratio, when available."""
+        """Return the stored-to-logical ratio for exact results."""
 
         if (
             self.is_estimate
@@ -148,7 +169,7 @@ class ScanResult:
 
     @property
     def ratio_fraction(self) -> Fraction | None:
-        """Return the exact ratio used for sorting, when available."""
+        """Return the exact stored-to-logical ratio used for sorting."""
 
         if (
             self.is_estimate
@@ -160,7 +181,7 @@ class ScanResult:
 
     @property
     def savings_bytes(self) -> int | None:
-        """Return exact savings when complete compression statistics exist."""
+        """Return the logical-minus-stored byte difference for exact results."""
 
         if (
             self.is_estimate
@@ -177,7 +198,22 @@ class ScanResult:
         return (
             self.disk_usage_bytes is not None
             and self.uncompressed_bytes is not None
-            and self.referenced_bytes is not None
+            and (self.is_ntfs or self.referenced_bytes is not None)
+        )
+
+    @property
+    def ntfs_summary(self) -> str | None:
+        """Describe NTFS-compressed and sparse files in this directory."""
+
+        if (
+            not self.is_ntfs
+            or self.ntfs_compressed_files is None
+            or self.ntfs_sparse_files is None
+        ):
+            return None
+        return (
+            f"NTFS-compressed files: {self.ntfs_compressed_files}; "
+            f"sparse files: {self.ntfs_sparse_files}."
         )
 
     @classmethod
@@ -208,6 +244,12 @@ class ScanResult:
             error=message,
             exit_code=exit_code,
         )
+
+    @classmethod
+    def unavailable_result(cls, path: Path, message: str) -> ScanResult:
+        """Create a terminal result when the filesystem has no supported metrics."""
+
+        return cls(path=path, state=ScanState.UNAVAILABLE, warning=message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +372,234 @@ class FilesystemDetector:
             if best_mount is None or candidate[:2] > best_mount[:2]:
                 best_mount = candidate
         return best_mount[2] if best_mount is not None else None
+
+
+class _FileBasicInfo(ctypes.Structure):
+    _fields_ = [
+        ("creation_time", ctypes.c_longlong),
+        ("last_access_time", ctypes.c_longlong),
+        ("last_write_time", ctypes.c_longlong),
+        ("change_time", ctypes.c_longlong),
+        ("attributes", ctypes.c_uint32),
+    ]
+
+
+class _FileStandardInfo(ctypes.Structure):
+    _fields_ = [
+        ("allocation_size", ctypes.c_longlong),
+        ("end_of_file", ctypes.c_longlong),
+        ("number_of_links", ctypes.c_uint32),
+        ("delete_pending", ctypes.c_ubyte),
+        ("directory", ctypes.c_ubyte),
+    ]
+
+
+class _FileIdInfo(ctypes.Structure):
+    _fields_ = [
+        ("volume_serial_number", ctypes.c_uint64),
+        ("file_id", ctypes.c_ubyte * 16),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsFileMetadata:
+    """Represent the read-only metadata needed for an NTFS scan."""
+
+    file_identity: tuple[int, bytes] | None
+    logical_size: int
+    allocated_size: int
+    is_directory: bool
+    is_reparse_point: bool
+    is_compressed: bool
+    is_sparse: bool
+
+
+class WindowsMetadataProvider(Protocol):
+    """Provide filesystem and file metadata for the Windows scan runner."""
+
+    def filesystem_type(self, path: Path) -> str:
+        """Return the filesystem name for the volume that contains ``path``."""
+
+    def inspect_path(self, path: Path) -> WindowsFileMetadata:
+        """Read one path's identity, sizes, and file attributes."""
+
+
+class WindowsFileApi:
+    """Read volume and file metadata through Windows Kernel32 APIs."""
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise OSError("Windows file APIs are only available on Windows.")
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            raise OSError("This Python runtime does not provide Windows APIs.")
+
+        self._kernel32: Any = loader("kernel32", use_last_error=True)
+        self._bind(
+            "GetVolumePathNameW",
+            (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32),
+            ctypes.c_int,
+        )
+        self._bind(
+            "GetVolumeInformationW",
+            (
+                ctypes.c_wchar_p,
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+            ),
+            ctypes.c_int,
+        )
+        self._bind(
+            "CreateFileW",
+            (
+                ctypes.c_wchar_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_void_p,
+            ),
+            ctypes.c_void_p,
+        )
+        self._bind(
+            "GetFileInformationByHandleEx",
+            (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32),
+            ctypes.c_int,
+        )
+        self._bind("CloseHandle", (ctypes.c_void_p,), ctypes.c_int)
+        self._bind("GetLastError", (), ctypes.c_uint32)
+
+    def _bind(self, name: str, argtypes: tuple[Any, ...], restype: Any) -> None:
+        """Set the ctypes signature for one Kernel32 function."""
+
+        function = getattr(self._kernel32, name)
+        function.argtypes = argtypes
+        function.restype = restype
+
+    def filesystem_type(self, path: Path) -> str:
+        """Return the filesystem name for the volume that contains ``path``."""
+
+        volume_path = ctypes.create_unicode_buffer(32768)
+        if not self._kernel32.GetVolumePathNameW(
+            self._extended_path(path), volume_path, len(volume_path)
+        ):
+            raise self._last_error(f"Cannot identify the volume for {path}")
+
+        volume_label = ctypes.create_unicode_buffer(261)
+        filesystem_name = ctypes.create_unicode_buffer(64)
+        volume_serial = ctypes.c_uint32()
+        maximum_component_length = ctypes.c_uint32()
+        filesystem_flags = ctypes.c_uint32()
+        if not self._kernel32.GetVolumeInformationW(
+            volume_path.value,
+            volume_label,
+            len(volume_label),
+            ctypes.byref(volume_serial),
+            ctypes.byref(maximum_component_length),
+            ctypes.byref(filesystem_flags),
+            filesystem_name,
+            len(filesystem_name),
+        ):
+            raise self._last_error(f"Cannot read filesystem information for {path}")
+        return filesystem_name.value
+
+    def inspect_path(self, path: Path) -> WindowsFileMetadata:
+        """Read path metadata without opening file contents."""
+
+        invalid_handle = ctypes.c_void_p(-1).value
+        handle = self._kernel32.CreateFileW(
+            self._extended_path(path),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle is None or handle == invalid_handle:
+            raise self._last_error(f"Cannot inspect {path}")
+
+        try:
+            basic_info = self._query_file_info(
+                handle,
+                FILE_INFO_CLASS_BASIC,
+                _FileBasicInfo(),
+            )
+            attributes = basic_info.attributes
+            is_directory = bool(attributes & FILE_ATTRIBUTE_DIRECTORY)
+            is_reparse_point = bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            is_compressed = bool(attributes & FILE_ATTRIBUTE_COMPRESSED)
+            is_sparse = bool(attributes & FILE_ATTRIBUTE_SPARSE_FILE)
+            if is_directory or is_reparse_point:
+                return WindowsFileMetadata(
+                    file_identity=None,
+                    logical_size=0,
+                    allocated_size=0,
+                    is_directory=is_directory,
+                    is_reparse_point=is_reparse_point,
+                    is_compressed=is_compressed,
+                    is_sparse=is_sparse,
+                )
+
+            standard_info = self._query_file_info(
+                handle,
+                FILE_INFO_CLASS_STANDARD,
+                _FileStandardInfo(),
+            )
+            id_info = self._query_file_info(
+                handle,
+                FILE_INFO_CLASS_ID,
+                _FileIdInfo(),
+            )
+            if standard_info.end_of_file < 0 or standard_info.allocation_size < 0:
+                raise OSError(f"Windows returned an invalid size for {path}")
+            identity = (
+                int(id_info.volume_serial_number),
+                bytes(id_info.file_id),
+            )
+            return WindowsFileMetadata(
+                file_identity=identity,
+                logical_size=int(standard_info.end_of_file),
+                allocated_size=int(standard_info.allocation_size),
+                is_directory=False,
+                is_reparse_point=False,
+                is_compressed=is_compressed,
+                is_sparse=is_sparse,
+            )
+        finally:
+            self._kernel32.CloseHandle(handle)
+
+    def _query_file_info(self, handle: int, info_class: int, info: Any) -> Any:
+        """Read one documented file-information class from an open handle."""
+
+        if not self._kernel32.GetFileInformationByHandleEx(
+            handle, info_class, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            raise self._last_error("Cannot read file metadata")
+        return info
+
+    def _last_error(self, operation: str) -> OSError:
+        """Create an error that includes the Windows API error code."""
+
+        error_code = int(self._kernel32.GetLastError())
+        return OSError(f"{operation} (Windows error {error_code})")
+
+    @staticmethod
+    def _extended_path(path: Path) -> str:
+        """Prepare a path for Unicode Win32 calls, including long paths."""
+
+        absolute_path = os.path.abspath(os.fspath(path))
+        if absolute_path.startswith("\\\\?\\"):
+            return absolute_path
+        if absolute_path.startswith("\\\\"):
+            return f"\\\\?\\UNC\\{absolute_path[2:]}"
+        return f"\\\\?\\{absolute_path}"
 
 
 def enumerate_directories(path: Path) -> DirectoryListing:
@@ -624,6 +894,202 @@ class DuRunner:
             if process.returncode is None:
                 process.kill()
             await process.communicate()
+
+
+class WindowsScanRunner:
+    """Measure NTFS directories with read-only metadata APIs on worker threads."""
+
+    def __init__(
+        self,
+        file_api: WindowsMetadataProvider | None = None,
+        concurrency: int = DEFAULT_CONCURRENCY,
+    ) -> None:
+        if concurrency < 1:
+            raise ValueError("Scan concurrency must be at least one.")
+        self.file_api = file_api if file_api is not None else WindowsFileApi()
+        self._scan_slots = asyncio.Semaphore(concurrency)
+        self._cancellation_events: set[threading.Event] = set()
+        self._worker_tasks: set[asyncio.Task[ScanResult]] = set()
+
+    async def scan(self, path: Path) -> ScanResult:
+        """Select metrics by volume and scan NTFS paths without reading file data."""
+
+        await self._scan_slots.acquire()
+        cancellation = threading.Event()
+        self._cancellation_events.add(cancellation)
+        worker = asyncio.create_task(asyncio.to_thread(self._scan, path, cancellation))
+        self._worker_tasks.add(worker)
+        worker.add_done_callback(
+            lambda completed: self._scan_finished(completed, cancellation)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation.set()
+            raise
+
+    def _scan_finished(
+        self,
+        worker: asyncio.Task[ScanResult],
+        cancellation: threading.Event,
+    ) -> None:
+        """Release one scan slot when its worker thread has stopped."""
+
+        self._worker_tasks.discard(worker)
+        self._cancellation_events.discard(cancellation)
+        self._scan_slots.release()
+
+    def _scan(self, path: Path, cancellation: threading.Event) -> ScanResult:
+        """Detect one volume and return its NTFS scan or unsupported status."""
+
+        try:
+            filesystem_type = self.file_api.filesystem_type(path)
+        except OSError as exc:
+            return ScanResult.error_result(
+                path,
+                f"Could not identify the filesystem for {path}: {exc}",
+            )
+        if filesystem_type.casefold() != "ntfs":
+            filesystem_label = filesystem_type or "an unknown filesystem"
+            return ScanResult.unavailable_result(
+                path,
+                f"Size measurements are unavailable on {filesystem_label}.",
+            )
+        if cancellation.is_set():
+            return ScanResult.error_result(path, "The NTFS scan was canceled.")
+
+        try:
+            root_metadata = self.file_api.inspect_path(path)
+        except OSError as exc:
+            return ScanResult.error_result(
+                path,
+                f"Could not inspect scan root {path}: {exc}",
+            )
+        if not root_metadata.is_directory:
+            return ScanResult.error_result(
+                path, f"Scan target is not a directory: {path}"
+            )
+        if cancellation.is_set():
+            return ScanResult.error_result(path, "The NTFS scan was canceled.")
+
+        return self._scan_ntfs(path, cancellation)
+
+    def _scan_ntfs(
+        self,
+        path: Path,
+        cancellation: threading.Event,
+    ) -> ScanResult:
+        """Aggregate unique file sizes and attributes below one NTFS directory."""
+
+        directories = [path]
+        seen_files: set[tuple[int, bytes]] = set()
+        logical_size = 0
+        allocated_size = 0
+        measured_files = 0
+        compressed_files = 0
+        sparse_files = 0
+        skipped_reparse_points = 0
+        failed_paths = 0
+        diagnostics: list[str] = []
+
+        while directories and not cancellation.is_set():
+            directory_path = directories.pop()
+            try:
+                directory = os.scandir(directory_path)
+            except OSError as exc:
+                failed_paths += 1
+                self._add_diagnostic(diagnostics, directory_path, exc)
+                continue
+
+            with directory:
+                try:
+                    for entry in directory:
+                        if cancellation.is_set():
+                            break
+                        entry_path = Path(entry.path)
+                        try:
+                            metadata = self.file_api.inspect_path(entry_path)
+                        except OSError as exc:
+                            failed_paths += 1
+                            self._add_diagnostic(diagnostics, entry_path, exc)
+                            continue
+
+                        if metadata.is_reparse_point:
+                            skipped_reparse_points += 1
+                            continue
+                        if metadata.is_directory:
+                            directories.append(entry_path)
+                            continue
+                        if metadata.file_identity is None:
+                            failed_paths += 1
+                            self._add_diagnostic(
+                                diagnostics,
+                                entry_path,
+                                OSError("Windows did not return a file identity"),
+                            )
+                            continue
+                        if metadata.file_identity in seen_files:
+                            continue
+
+                        seen_files.add(metadata.file_identity)
+                        measured_files += 1
+                        logical_size += metadata.logical_size
+                        allocated_size += metadata.allocated_size
+                        if metadata.is_compressed:
+                            compressed_files += 1
+                        if metadata.is_sparse:
+                            sparse_files += 1
+                except OSError as exc:
+                    failed_paths += 1
+                    self._add_diagnostic(diagnostics, directory_path, exc)
+
+        if cancellation.is_set():
+            return ScanResult.error_result(path, "The NTFS scan was canceled.")
+
+        warning_parts: list[str] = []
+        if skipped_reparse_points:
+            warning_parts.append(f"Skipped {skipped_reparse_points} reparse point(s).")
+        error: str | None = None
+        if failed_paths:
+            error = (
+                f"Could not inspect {failed_paths} path(s); NTFS totals are partial."
+            )
+            if diagnostics:
+                error = diagnostic_text(f"{error} {'; '.join(diagnostics)}")
+
+        statistics_available = failed_paths == 0 or measured_files > 0
+        return ScanResult(
+            path=path,
+            state=ScanState.ERROR if failed_paths else ScanState.COMPLETE,
+            disk_usage_bytes=allocated_size if statistics_available else None,
+            uncompressed_bytes=logical_size if statistics_available else None,
+            warning=" ".join(warning_parts) or None,
+            error=error,
+            is_ntfs=True,
+            ntfs_compressed_files=compressed_files,
+            ntfs_sparse_files=sparse_files,
+        )
+
+    @staticmethod
+    def _add_diagnostic(
+        diagnostics: list[str],
+        path: Path,
+        error: OSError,
+    ) -> None:
+        """Keep a bounded sample of failures from a partial tree scan."""
+
+        if len(diagnostics) < 10:
+            message = diagnostic_text(str(error)) or type(error).__name__
+            diagnostics.append(diagnostic_text(f"{path}: {message}"))
+
+    async def close(self) -> None:
+        """Stop active filesystem walks and wait for their worker threads."""
+
+        for cancellation in tuple(self._cancellation_events):
+            cancellation.set()
+        workers = tuple(self._worker_tasks)
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
 
 
 PrivilegeAuthorization = Callable[[Sequence[str]], Awaitable[bool]]
@@ -1060,7 +1526,7 @@ def sort_records(
             and result.state is ScanState.COMPLETE
             and result.uncompressed_bytes is not None
         ):
-            source_order = 1 if result.is_estimate else 0
+            source_order = 2 if result.is_estimate else 1 if result.is_ntfs else 0
             return (source_order, -result.uncompressed_bytes, name_key, identity)
         if mode is SortMode.RATIO and result.state is ScanState.COMPLETE:
             ratio = result.ratio_fraction
@@ -1070,7 +1536,7 @@ def sort_records(
             savings = result.savings_bytes
             if savings is not None:
                 return (0, -savings, name_key, identity)
-        return (2, record.ordinal, name_key, identity)
+        return (3, record.ordinal, name_key, identity)
 
     return sorted(records, key=key)
 
@@ -1209,7 +1675,11 @@ class BrowserModel:
         offscreen_start = len(ordered)
         requests: list[ScanRequest] = []
         for index, record in enumerate(ordered):
-            if record.result.state in {ScanState.COMPLETE, ScanState.ERROR}:
+            if record.result.state in {
+                ScanState.COMPLETE,
+                ScanState.ERROR,
+                ScanState.UNAVAILABLE,
+            }:
                 continue
             key = path_key(record.entry.path)
             if key == selected_key:
@@ -1480,10 +1950,11 @@ def format_ratio(ratio: float | None) -> str:
 
 @dataclass(frozen=True, slots=True)
 class BarScales:
-    """Keep bar normalization separate for exact and estimated results."""
+    """Keep bar normalization separate for each result metric source."""
 
     compsize_maximum: int
     estimate_maximum: int
+    ntfs_maximum: int = 0
 
     @classmethod
     def from_records(cls, records: Iterable[DirectoryRecord]) -> BarScales:
@@ -1491,6 +1962,7 @@ class BarScales:
 
         compsize_maximum = 0
         estimate_maximum = 0
+        ntfs_maximum = 0
         for record in records:
             result = record.result
             if result.state is not ScanState.COMPLETE:
@@ -1499,15 +1971,19 @@ class BarScales:
                 result.uncompressed_bytes or 0,
                 result.disk_usage_bytes or 0,
             )
-            if result.is_estimate:
+            if result.is_ntfs:
+                ntfs_maximum = max(ntfs_maximum, size)
+            elif result.is_estimate:
                 estimate_maximum = max(estimate_maximum, size)
             else:
                 compsize_maximum = max(compsize_maximum, size)
-        return cls(compsize_maximum, estimate_maximum)
+        return cls(compsize_maximum, estimate_maximum, ntfs_maximum)
 
     def maximum_for(self, result: ScanResult) -> int:
         """Return the scale for the result's metric source."""
 
+        if result.is_ntfs:
+            return self.ntfs_maximum
         return self.estimate_maximum if result.is_estimate else self.compsize_maximum
 
     def include(self, result: ScanResult) -> BarScales:
@@ -1519,12 +1995,23 @@ class BarScales:
             result.uncompressed_bytes or 0,
             result.disk_usage_bytes or 0,
         )
+        if result.is_ntfs:
+            return BarScales(
+                self.compsize_maximum,
+                self.estimate_maximum,
+                max(self.ntfs_maximum, size),
+            )
         if result.is_estimate:
             return BarScales(
                 self.compsize_maximum,
                 max(self.estimate_maximum, size),
+                self.ntfs_maximum,
             )
-        return BarScales(max(self.compsize_maximum, size), self.estimate_maximum)
+        return BarScales(
+            max(self.compsize_maximum, size),
+            self.estimate_maximum,
+            self.ntfs_maximum,
+        )
 
 
 def render_bar(
@@ -1553,6 +2040,9 @@ def render_bar(
         bar.append("░" * max(0, logical_cells - disk_cells), style=BAR_STYLE)
         bar.append(" " * max(0, width - max(logical_cells, disk_cells)))
         return bar
+    if result.state is ScanState.UNAVAILABLE:
+        bar.append("·" * width, style="dim")
+        return bar
     if result.state is ScanState.ERROR:
         bar.append("!" * width, style="red")
     else:
@@ -1567,14 +2057,25 @@ class DirectoryRow(Static):
         super().__init__(markup=False, classes="directory-row")
         self.record = record
         self.bar_scales = bar_scales
-        self.tooltip = record.result.error or record.result.warning
+        self.tooltip = self._tooltip_text(record.result)
+
+    @staticmethod
+    def _tooltip_text(result: ScanResult) -> str | None:
+        """Combine errors, warnings, and filesystem-specific row details."""
+
+        details = [result.error] if result.error else []
+        if result.warning and (result.is_ntfs or not result.error):
+            details.append(result.warning)
+        if result.ntfs_summary:
+            details.append(result.ntfs_summary)
+        return " ".join(item for item in details if item) or None
 
     def update_record(self, record: DirectoryRecord, bar_scales: BarScales) -> None:
         """Replace row data and refresh its display."""
 
         self.record = record
         self.bar_scales = bar_scales
-        self.tooltip = record.result.error or record.result.warning
+        self.tooltip = self._tooltip_text(record.result)
         self.refresh()
 
     def on_resize(self, _event: events.Resize) -> None:
@@ -1603,9 +2104,23 @@ class DirectoryRow(Static):
         size = format_bytes(result.uncompressed_bytes)
         if result.is_estimate and result.uncompressed_bytes is not None:
             size = f"~{size}"
+        if result.is_ntfs:
+            markers = "".join(
+                marker
+                for marker, count in (
+                    ("C", result.ntfs_compressed_files),
+                    ("S", result.ntfs_sparse_files),
+                )
+                if count is not None and count > 0
+            )
+            if markers:
+                ratio_or_used = f"{ratio_or_used} {markers}"
         if result.state is ScanState.ERROR and not result.has_statistics:
             ratio_or_used = "error"
             size = "error"
+        elif result.state is ScanState.UNAVAILABLE:
+            ratio_or_used = "—"
+            size = "—"
 
         line = Text()
         line.append(pad_right(name, NAME_COLUMN_WIDTH))
@@ -1621,7 +2136,7 @@ class DirectoryRow(Static):
         line.append(pad_left(size, SIZE_COLUMN_WIDTH))
         if result.state is ScanState.ERROR:
             line.stylize("red", ratio_start, len(line.plain))
-        elif result.state is ScanState.RUNNING:
+        elif result.state in {ScanState.RUNNING, ScanState.UNAVAILABLE}:
             line.stylize("dim", ratio_start, len(line.plain))
         elif result.warning:
             line.stylize("yellow", ratio_start, size_start)
@@ -1692,13 +2207,18 @@ r               Refresh current directory and rescan
 q               Quit
 
 Bars show allocated usage (█) and the difference to the size
-baseline (░). The size column shows uncompressed extent bytes for
-compsize results. When elevated scans are unavailable, du provides
-apparent-size and allocated-space estimates. A ~ marks estimated values
-in both numeric columns. Bars use separate scales for each source.
-These estimates are not Btrfs extent statistics.
-Independent directory scans are not additive because Btrfs
-reflinks and shared extents may overlap.
+baseline (░). On Btrfs, the size column shows uncompressed extent bytes.
+On NTFS, it shows logical size; Stored/Logical compares allocated bytes
+with logical bytes. C marks NTFS-compressed files, and S marks sparse
+files. The selected-row status and tooltip show their counts. Sparse
+allocation can affect Stored/Logical, so that value is not a compression-only
+ratio.
+
+When elevated Btrfs scans are unavailable, du provides apparent-size
+and allocated-space estimates. A ~ marks estimated values in both
+numeric columns. Bars use separate scales for each source. These
+estimates are not Btrfs extent statistics. Independent Btrfs directory
+scans are not additive because reflinks and shared extents may overlap.
 
 Esc             Close help"""
         yield Container(Static(Text(text), id="help-text"), id="help-dialog")
@@ -1865,7 +2385,13 @@ class CompsizerApp(App[None]):
         self.runner = (
             runner
             if runner is not None
-            else CompsizeRunner(authorization_callback=self._authorize_elevated_scans)
+            else (
+                WindowsScanRunner()
+                if os.name == "nt"
+                else CompsizeRunner(
+                    authorization_callback=self._authorize_elevated_scans
+                )
+            )
         )
         self.manager = ScanManager(self.runner, self._on_scan_update)
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -1915,7 +2441,7 @@ class CompsizerApp(App[None]):
         self._track(self._initialize())
 
     async def on_unmount(self) -> None:
-        """Stop directory loading and subprocess workers before exit."""
+        """Stop directory loading and scan workers before exit."""
 
         self._shutting_down = True
         self._ui_ready = False
@@ -1944,19 +2470,23 @@ class CompsizerApp(App[None]):
     async def _check_startup_environment(self, initial_path: Path) -> None:
         """Check optional scanner access without delaying initial navigation."""
 
-        mountinfo = await asyncio.to_thread(FilesystemDetector.read_mountinfo)
-        if self._shutting_down:
-            return
-        if mountinfo is not None:
-            filesystem_type = FilesystemDetector.filesystem_type(
-                initial_path,
-                mountinfo,
-            )
-            if filesystem_type is not None and filesystem_type.casefold() != "btrfs":
-                self._startup_notices.append(
-                    f"Initial path is on {filesystem_type}; Btrfs child mounts can "
-                    "still be browsed."
+        if os.name != "nt":
+            mountinfo = await asyncio.to_thread(FilesystemDetector.read_mountinfo)
+            if self._shutting_down:
+                return
+            if mountinfo is not None:
+                filesystem_type = FilesystemDetector.filesystem_type(
+                    initial_path,
+                    mountinfo,
                 )
+                if (
+                    filesystem_type is not None
+                    and filesystem_type.casefold() != "btrfs"
+                ):
+                    self._startup_notices.append(
+                        f"Initial path is on {filesystem_type}; Btrfs child mounts can "
+                        "still be browsed."
+                    )
         if isinstance(self.runner, CompsizeRunner):
             executable = await asyncio.to_thread(shutil.which, self.runner.executable)
             if executable is None:
@@ -2340,6 +2870,8 @@ class CompsizerApp(App[None]):
             f"errors {counts[ScanState.ERROR]}",
             f"page {self._page_index + 1}/{page_count}",
         ]
+        if counts[ScanState.UNAVAILABLE]:
+            parts.append(f"unavailable {counts[ScanState.UNAVAILABLE]}")
         parts.extend(self._startup_notices)
         if self.model.listing_error:
             parts.append(self.model.listing_error)
@@ -2347,10 +2879,15 @@ class CompsizerApp(App[None]):
             parts.append(self.model.listing_warning)
         if self.model.selected_path is not None:
             selected = self.model.records.get(path_key(self.model.selected_path))
-            if selected is not None and selected.result.error:
-                parts.append(selected.result.error)
-            elif selected is not None and selected.result.warning:
-                parts.append(selected.result.warning)
+            if selected is not None:
+                if selected.result.error:
+                    parts.append(selected.result.error)
+                if selected.result.warning and (
+                    selected.result.is_ntfs or not selected.result.error
+                ):
+                    parts.append(selected.result.warning)
+                if selected.result.ntfs_summary:
+                    parts.append(selected.result.ntfs_summary)
         status_text = "  ".join(parts)
         content_width = max(1, status.size.width - 2)
         maximum_cells = content_width * 2
@@ -2358,11 +2895,20 @@ class CompsizerApp(App[None]):
             status_text = f"{_take_cells(status_text, maximum_cells - 1)}…"
         status.update(Text(status_text))
 
-    @staticmethod
-    def _column_header() -> str:
+    def _column_header(self) -> str:
         """Return the fixed-column header shown above the rows."""
 
-        return f"{pad_right('Directory', NAME_COLUMN_WIDTH)} {'Bar':<{10}} {pad_left('Ratio/Used', RATIO_COLUMN_WIDTH)} {pad_left('Size', SIZE_COLUMN_WIDTH)}"
+        if isinstance(self.runner, WindowsScanRunner):
+            ratio_label = "Stored/Logical"
+            size_label = "Logical Size"
+        else:
+            ratio_label = "Ratio/Used"
+            size_label = "Size"
+        return (
+            f"{pad_right('Directory', NAME_COLUMN_WIDTH)} {'Bar':<{10}} "
+            f"{pad_left(ratio_label, RATIO_COLUMN_WIDTH)} "
+            f"{pad_left(size_label, SIZE_COLUMN_WIDTH)}"
+        )
 
     @staticmethod
     def _tree_label(path: Path) -> Text:
@@ -2684,7 +3230,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="compsizer",
-        description="Browse Btrfs compression statistics with compsize.",
+        description="Browse directories and filesystem compression statistics.",
     )
     parser.add_argument(
         "path",

@@ -1,8 +1,8 @@
 # compsizer
 
-`compsizer` is a terminal browser for exploring Btrfs compression. It shows
-the direct child directories of the current directory and measures each child
-with the external `compsize` command.
+`compsizer` is a terminal directory browser with filesystem-specific size
+statistics. On Linux, it reports Btrfs compression through `compsize`. On
+Windows 10 or newer, it reports NTFS logical and allocated sizes.
 
 Filesystem navigation does not wait for compression measurements. Directory
 names appear after direct enumeration, and scan results update rows as the
@@ -13,10 +13,15 @@ bounded background scan manager receives them.
 - Python 3.11 or newer
 - [`uv`](https://docs.astral.sh/uv/)
 - Textual (installed from the script's PEP 723 metadata)
-- `compsize` available in `PATH`
-- GNU `du` from coreutils available in `PATH` for fallback size estimates
-- A Btrfs filesystem for compression statistics
-- `sudo` available in `PATH` if elevated scan access is needed
+
+On Linux, `compsize` and a Btrfs filesystem are needed for Btrfs compression
+statistics. GNU `du` from coreutils provides fallback size estimates. `sudo` is
+needed only if a Btrfs scan requires elevated access.
+
+On Windows 10 or newer, NTFS volumes provide logical and allocated-size
+statistics. Other Windows filesystems remain browsable, but do not provide size
+statistics. The app works from the standard Command Prompt (`cmd.exe`); Windows
+Terminal is not required.
 
 `compsize` uses Btrfs ioctls. Depending on the system, those operations may
 require elevated privileges. Compsizer first tries scans as the current user.
@@ -32,8 +37,9 @@ stays open and shows GNU `du` estimates for apparent size and allocated space.
 These estimates do not include Btrfs extent statistics. If `compsize` is
 missing, the browser stays open and reports scan errors.
 
-If the starting path is on another filesystem, Compsizer shows a warning but
-continues. A child directory can be a Btrfs mount.
+On Linux, if the starting path is on another filesystem, Compsizer shows a
+warning but continues. A child directory can be a Btrfs mount. On Windows,
+Compsizer selects the scanner from the volume for each directory scan.
 
 ## Run
 
@@ -49,8 +55,15 @@ Pass a different initial directory when needed:
 uv run --script compsizer.py /some/btrfs/path
 ```
 
-The script also has a `uv` shebang, so an executable checkout may be started
-with `./compsizer.py`.
+On Windows, run the same command from `cmd.exe` and pass a Windows path when
+needed:
+
+```console
+uv run --script compsizer.py C:\Users\name\Documents
+```
+
+On Unix-like systems, the script's `uv` shebang also allows an executable
+checkout to start with `./compsizer.py`.
 
 ## Controls
 
@@ -66,14 +79,13 @@ with `./compsizer.py`.
 - `?`: show help
 - `q`: quit
 
-Size sorting lists exact `compsize` results first, ordered by uncompressed
-extent size. It then lists `du` estimates, ordered by apparent size. The two
-groups are not compared with each other. Ratio sorting uses exact `compsize`
-results, with the lowest ratio first. Savings sorting uses exact `compsize`
-results, with the largest difference first. Fallback rows sort after exact
-results for ratio and savings modes. Name sorting uses case-insensitive
-directory names. Pending and error rows remain below rows with known values
-for numeric sorts; name sorting includes every row in name order.
+Size sorting orders `compsize`, NTFS, and `du` results in separate groups. It
+does not compare values across groups. Ratio and savings sorting use available
+exact results. On NTFS, these values compare allocated bytes with logical
+bytes; sparse files can affect them. Fallback rows sort after exact results.
+Name sorting uses case-insensitive directory names. Pending, unavailable, and
+error rows remain below rows with known values for numeric sorts; name sorting
+includes every row in name order.
 
 ## Data and limitations
 
@@ -81,11 +93,22 @@ for numeric sorts; name sorting includes every row in name order.
 - With `compsize`, the visible size is the uncompressed extent size. It is not
   the apparent size reported by the `Referenced` column. After sudo is
   declined, the visible size is `du`'s apparent size.
+- On NTFS, the size column shows logical file bytes and the `Stored/Logical`
+  column compares allocated bytes with logical bytes. `C` marks a tree with
+  NTFS-compressed files; `S` marks a tree with sparse files. The selected-row
+  status and row tooltip show the counts. Sparse allocation affects the ratio,
+  so it is not a compression-only measurement.
+- NTFS scans read file metadata only and count a hard-linked file once per
+  scanned tree. Scans skip reparse points below their selected root, so parent
+  scans do not cross directory mount points. A mount point that the user opens
+  is scanned on its own volume. Inaccessible paths produce a partial result or
+  an error. Windows does not need an elevated process.
+- Non-NTFS Windows filesystems can be browsed without size statistics.
 - The bar uses a solid glyph for allocated space and a separate glyph for the
-  difference to the size baseline. Exact results and estimates use separate
-  bar scales. A `~` prefix marks both numeric values for fallback rows: the
-  allocated-space estimate in Ratio/Used and the apparent-size estimate in
-  Size.
+  difference to the size baseline. Btrfs, NTFS, and estimate results use
+  separate bar scales. A `~` prefix marks both numeric values on fallback
+  rows: the allocated-space estimate in Ratio/Used and the apparent-size
+  estimate in Size.
 - `du` estimates are not Btrfs extent statistics. Shared extents can make
   allocated-space totals differ from unique physical usage.
 - Independent child scans are not additive. Btrfs reflinks, deduplication,
