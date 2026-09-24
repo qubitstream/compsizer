@@ -65,13 +65,14 @@ with `./compsizer.py`.
 - `?`: show help
 - `q`: quit
 
-Size sorting uses uncompressed bytes or fallback apparent size, with the
-largest directory first. Ratio sorting uses exact `compsize` results, with
-the lowest ratio first. Savings sorting uses exact `compsize` results, with
-the largest difference first. Fallback rows sort after exact results for
-ratio and savings modes. Name sorting uses case-insensitive directory names.
-Pending and error rows remain below rows with known values for numeric sorts;
-name sorting includes every row in name order.
+Size sorting lists exact `compsize` results first, ordered by uncompressed
+extent size. It then lists `du` estimates, ordered by apparent size. The two
+groups are not compared with each other. Ratio sorting uses exact `compsize`
+results, with the lowest ratio first. Savings sorting uses exact `compsize`
+results, with the largest difference first. Fallback rows sort after exact
+results for ratio and savings modes. Name sorting uses case-insensitive
+directory names. Pending and error rows remain below rows with known values
+for numeric sorts; name sorting includes every row in name order.
 
 ## Data and limitations
 
@@ -80,8 +81,10 @@ name sorting includes every row in name order.
   the apparent size reported by the `Referenced` column. After sudo is
   declined, the visible size is `du`'s apparent size.
 - The bar uses a solid glyph for allocated space and a separate glyph for the
-  difference to the size baseline. For fallback rows, the Ratio/Used column
-  shows estimated allocated bytes with a `~` prefix.
+  difference to the size baseline. Exact results and estimates use separate
+  bar scales. A `~` prefix marks both numeric values for fallback rows: the
+  allocated-space estimate in Ratio/Used and the apparent-size estimate in
+  Size.
 - `du` estimates are not Btrfs extent statistics. Shared extents can make
   allocated-space totals differ from unique physical usage.
 - Independent child scans are not additive. Btrfs reflinks, deduplication,

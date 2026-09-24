@@ -10,6 +10,7 @@ from unittest.mock import patch
 from textual.widgets import ListView
 
 from compsizer import (
+    BarScales,
     BrowserModel,
     CompsizeParseError,
     CompsizerApp,
@@ -33,6 +34,7 @@ from compsizer import (
     enumerate_directories,
     normalize_initial_path,
     parse_compsize_output,
+    render_bar,
     sort_records,
 )
 
@@ -168,6 +170,77 @@ class SortingTests(unittest.TestCase):
             [record.entry.name for record in ordered],
             ["large", "small", "pending", "error"],
         )
+
+    def test_size_sort_keeps_exact_and_estimated_values_in_separate_groups(
+        self,
+    ) -> None:
+        records = [
+            self.record(
+                "estimate-large",
+                0,
+                ScanResult(
+                    Path("/root/estimate-large"),
+                    ScanState.COMPLETE,
+                    400,
+                    2000,
+                    None,
+                    is_estimate=True,
+                ),
+            ),
+            self.record(
+                "exact-small",
+                1,
+                ScanResult(Path("/root/exact-small"), ScanState.COMPLETE, 10, 100, 100),
+            ),
+            self.record(
+                "estimate-small",
+                2,
+                ScanResult(
+                    Path("/root/estimate-small"),
+                    ScanState.COMPLETE,
+                    40,
+                    50,
+                    None,
+                    is_estimate=True,
+                ),
+            ),
+            self.record(
+                "exact-large",
+                3,
+                ScanResult(Path("/root/exact-large"), ScanState.COMPLETE, 20, 200, 200),
+            ),
+        ]
+
+        ordered = sort_records(records, SortMode.SIZE)
+
+        self.assertEqual(
+            [record.entry.name for record in ordered],
+            ["exact-large", "exact-small", "estimate-large", "estimate-small"],
+        )
+
+    def test_bar_scales_are_independent_for_exact_and_estimated_results(
+        self,
+    ) -> None:
+        exact = ScanResult(Path("/root/exact"), ScanState.COMPLETE, 40, 100, 100)
+        estimate = ScanResult(
+            Path("/root/estimate"),
+            ScanState.COMPLETE,
+            400,
+            1000,
+            None,
+            is_estimate=True,
+        )
+        scales = BarScales.from_records(
+            [
+                DirectoryRecord(DirectoryEntry(exact.path, "exact"), exact, 0),
+                DirectoryRecord(DirectoryEntry(estimate.path, "estimate"), estimate, 1),
+            ]
+        )
+
+        exact_bar = render_bar(exact, scales.maximum_for(exact), 12)
+        estimate_bar = render_bar(estimate, scales.maximum_for(estimate), 12)
+
+        self.assertEqual(exact_bar.plain, estimate_bar.plain)
 
     def test_ratio_best_first(self) -> None:
         records = [
@@ -723,12 +796,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.is_estimate)
             self.assertIsNone(result.ratio)
             self.assertIsNone(result.ratio_fraction)
-            row = DirectoryRow(
-                DirectoryRecord(DirectoryEntry(path, path.name), result, 0),
-                1200,
-            )
+            record = DirectoryRecord(DirectoryEntry(path, path.name), result, 0)
+            row = DirectoryRow(record, BarScales.from_records([record]))
             self.assertIn("~700 B", row.render().plain)
-            self.assertIn("1.2 KiB", row.render().plain)
+            self.assertIn("~1.2 KiB", row.render().plain)
             await runner.close()
 
     async def test_du_runner_keeps_partial_totals_with_a_warning(self) -> None:

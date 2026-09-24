@@ -1036,7 +1036,8 @@ def sort_records(
             and result.state is ScanState.COMPLETE
             and result.uncompressed_bytes is not None
         ):
-            return (0, -result.uncompressed_bytes, name_key, identity)
+            source_order = 1 if result.is_estimate else 0
+            return (source_order, -result.uncompressed_bytes, name_key, identity)
         if mode is SortMode.RATIO and result.state is ScanState.COMPLETE:
             ratio = result.ratio_fraction
             if ratio is not None:
@@ -1045,7 +1046,7 @@ def sort_records(
             savings = result.savings_bytes
             if savings is not None:
                 return (0, -savings, name_key, identity)
-        return (1, record.ordinal, name_key, identity)
+        return (2, record.ordinal, name_key, identity)
 
     return sorted(records, key=key)
 
@@ -1401,6 +1402,39 @@ def format_ratio(ratio: float | None) -> str:
     return f"{ratio * 100:.1f}%"
 
 
+@dataclass(frozen=True, slots=True)
+class BarScales:
+    """Keep bar normalization separate for exact and estimated results."""
+
+    compsize_maximum: int
+    estimate_maximum: int
+
+    @classmethod
+    def from_records(cls, records: Iterable[DirectoryRecord]) -> BarScales:
+        """Calculate independent maxima from complete rows."""
+
+        compsize_maximum = 0
+        estimate_maximum = 0
+        for record in records:
+            result = record.result
+            if result.state is not ScanState.COMPLETE:
+                continue
+            size = max(
+                result.uncompressed_bytes or 0,
+                result.disk_usage_bytes or 0,
+            )
+            if result.is_estimate:
+                estimate_maximum = max(estimate_maximum, size)
+            else:
+                compsize_maximum = max(compsize_maximum, size)
+        return cls(compsize_maximum, estimate_maximum)
+
+    def maximum_for(self, result: ScanResult) -> int:
+        """Return the scale for the result's metric source."""
+
+        return self.estimate_maximum if result.is_estimate else self.compsize_maximum
+
+
 def render_bar(
     result: ScanResult,
     maximum_size: int,
@@ -1435,17 +1469,17 @@ def render_bar(
 class DirectoryRow(Static):
     """Render one directory record with responsive columns."""
 
-    def __init__(self, record: DirectoryRecord, maximum_size: int) -> None:
+    def __init__(self, record: DirectoryRecord, bar_scales: BarScales) -> None:
         super().__init__(markup=False, classes="directory-row")
         self.record = record
-        self.maximum_size = maximum_size
+        self.bar_scales = bar_scales
         self.tooltip = record.result.error or record.result.warning
 
-    def update_record(self, record: DirectoryRecord, maximum_size: int) -> None:
+    def update_record(self, record: DirectoryRecord, bar_scales: BarScales) -> None:
         """Replace row data and refresh its display."""
 
         self.record = record
-        self.maximum_size = maximum_size
+        self.bar_scales = bar_scales
         self.tooltip = record.result.error or record.result.warning
         self.refresh()
 
@@ -1473,6 +1507,8 @@ class DirectoryRow(Static):
         if result.is_estimate and result.disk_usage_bytes is not None:
             ratio_or_used = f"~{ratio_or_used}"
         size = format_bytes(result.uncompressed_bytes)
+        if result.is_estimate and result.uncompressed_bytes is not None:
+            size = f"~{size}"
         if result.state is ScanState.ERROR and not result.has_statistics:
             ratio_or_used = "error"
             size = "error"
@@ -1480,7 +1516,9 @@ class DirectoryRow(Static):
         line = Text()
         line.append(pad_right(name, NAME_COLUMN_WIDTH))
         line.append(" ")
-        line.append(render_bar(result, self.maximum_size, graph_width))
+        line.append(
+            render_bar(result, self.bar_scales.maximum_for(result), graph_width)
+        )
         line.append(" ")
         ratio_start = len(line.plain)
         line.append(pad_left(ratio_or_used, RATIO_COLUMN_WIDTH))
@@ -1561,8 +1599,8 @@ q               Quit
 Bars show allocated usage (█) and the difference to the size
 baseline (░). The size column shows uncompressed extent bytes for
 compsize results. When elevated scans are unavailable, du provides
-apparent-size and allocated-space estimates; the Ratio/Used column shows
-estimated allocated bytes with a ~ prefix.
+apparent-size and allocated-space estimates. A ~ marks estimated values
+in both numeric columns. Bars use separate scales for each source.
 These estimates are not Btrfs extent statistics.
 Independent directory scans are not additive because Btrfs
 reflinks and shared extents may overlap.
@@ -1960,17 +1998,7 @@ class CompsizerApp(App[None]):
                 return
             records = self.model.sorted_records()
             records_by_key = {path_key(record.entry.path): record for record in records}
-            maximum_size = max(
-                (
-                    max(
-                        record.result.uncompressed_bytes or 0,
-                        record.result.disk_usage_bytes or 0,
-                    )
-                    for record in records
-                    if record.result.state is ScanState.COMPLETE
-                ),
-                default=0,
-            )
+            bar_scales = BarScales.from_records(records)
 
             stale_keys = set(self._row_items) - set(records_by_key)
             for key in stale_keys:
@@ -1983,13 +2011,13 @@ class CompsizerApp(App[None]):
             for key, record in records_by_key.items():
                 row = self._row_widgets.get(key)
                 if row is None:
-                    row = DirectoryRow(record, maximum_size)
+                    row = DirectoryRow(record, bar_scales)
                     self._row_widgets[key] = row
                     item = ListItem(row)
                     self._row_items[key] = item
                     new_items.append(item)
                 else:
-                    row.update_record(record, maximum_size)
+                    row.update_record(record, bar_scales)
 
             if new_items:
                 try:
