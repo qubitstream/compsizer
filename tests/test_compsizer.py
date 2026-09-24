@@ -7,9 +7,11 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
-from textual.widgets import ListView
+from textual.widgets import ListView, Tree
 
 from compsizer import (
+    DIRECTORY_PAGE_SIZE,
+    TREE_CHILD_LIMIT,
     BarScales,
     BrowserModel,
     CompsizeParseError,
@@ -411,6 +413,7 @@ class NavigationTests(unittest.TestCase):
         model = BrowserModel(root, cache)
         view_id = model.begin_view(root)
         model.set_listing(view_id, DirectoryListing(root, (first, second)))
+        self.assertEqual(model.state_counts[ScanState.PENDING], 2)
         model.select(second.path)
 
         model.apply_scan_update(
@@ -424,6 +427,8 @@ class NavigationTests(unittest.TestCase):
 
         self.assertEqual(model.sorted_records()[0].entry.path, second.path)
         self.assertEqual(model.selected_path, second.path)
+        self.assertEqual(model.state_counts[ScanState.PENDING], 0)
+        self.assertEqual(model.state_counts[ScanState.COMPLETE], 2)
 
 
 class FakeRunner:
@@ -564,6 +569,56 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(runner.calls, [child, child])
                 await pilot.pause(0.1)
                 self.assertEqual(runner.calls, [child, child])
+
+    async def test_large_directory_rows_are_paginated_and_browsable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for index in range(205):
+                (root / f"child-{index:03d}").mkdir()
+            app = CompsizerApp(root, runner=FakeRunner(delay=30.0))
+
+            async with app.run_test(size=(120, 30)) as pilot:
+                directory_list = app.query_one("#directory-list", ListView)
+                tree = app.query_one("#directory-tree", Tree)
+                for _ in range(100):
+                    if (
+                        len(app.model.records) == 205
+                        and len(directory_list.children) == DIRECTORY_PAGE_SIZE
+                        and len(tree.root.children) == TREE_CHILD_LIMIT + 1
+                    ):
+                        break
+                    await pilot.pause(0.01)
+
+                self.assertEqual(len(app.model.records), 205)
+                self.assertEqual(len(directory_list.children), DIRECTORY_PAGE_SIZE)
+                self.assertEqual(len(tree.root.children), TREE_CHILD_LIMIT + 1)
+                self.assertIn("page 1/3", app.query_one("#status").render().plain)
+
+                await pilot.press("pagedown")
+                await pilot.pause(0.05)
+                self.assertEqual(app._page_index, 1)
+                self.assertEqual(len(directory_list.children), DIRECTORY_PAGE_SIZE)
+                self.assertEqual(app.model.selected_path, root / "child-100")
+
+                await pilot.press("pagedown")
+                await pilot.pause(0.05)
+                self.assertEqual(app._page_index, 2)
+                self.assertEqual(len(directory_list.children), 5)
+                self.assertEqual(app.model.selected_path, root / "child-200")
+
+                await pilot.press("pageup")
+                await pilot.pause(0.05)
+                self.assertEqual(app._page_index, 1)
+                self.assertEqual(app.model.selected_path, root / "child-100")
+
+                await pilot.press("pagedown")
+                await pilot.pause(0.05)
+                self.assertEqual(app._page_index, 2)
+                self.assertEqual(app.model.selected_path, root / "child-200")
+
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+                self.assertEqual(app.model.current_path, root / "child-200")
 
     async def test_home_and_end_keep_cursor_and_scroll_in_sync(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -734,6 +789,34 @@ class ScanManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(runner.maximum_active, 2)
         self.assertEqual(len(completed), 5)
         self.assertTrue(runner.closed)
+
+    async def test_priority_updates_ignore_stale_heap_entries(self) -> None:
+        runner = FakeRunner()
+        completed: list[Path] = []
+        all_done = asyncio.Event()
+
+        async def callback(_job: ScanJob, result: ScanResult) -> None:
+            if result.state is ScanState.COMPLETE:
+                completed.append(result.path)
+                if len(completed) == 2:
+                    all_done.set()
+
+        manager = ScanManager(runner, callback, concurrency=1)
+        first = Path("/root/first")
+        second = Path("/root/second")
+        await manager.set_view(
+            1,
+            [ScanRequest(first, 1, 1), ScanRequest(second, 1, 0)],
+        )
+        await manager.set_view(
+            1,
+            [ScanRequest(first, 1, -1), ScanRequest(second, 1, 0)],
+        )
+        await manager.start()
+        await asyncio.wait_for(all_done.wait(), timeout=1.0)
+        await manager.close()
+
+        self.assertEqual(completed, [first, second])
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):

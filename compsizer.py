@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import heapq
 import logging
 import os
 import re
@@ -40,6 +41,8 @@ from textual.widgets.tree import TreeNode
 LOGGER = logging.getLogger("compsizer")
 
 DEFAULT_CONCURRENCY = 2
+DIRECTORY_PAGE_SIZE = 100
+TREE_CHILD_LIMIT = 100
 MAX_DIAGNOSTIC_LENGTH = 500
 ROW_REFRESH_DELAY = 0.02
 # Do not resolve elevated commands through the user's environment PATH.
@@ -1060,6 +1063,7 @@ class BrowserModel:
         self.sort_mode = SortMode.SIZE
         self.view_id = 0
         self.records: dict[str, DirectoryRecord] = {}
+        self._state_counts: dict[ScanState, int] = {state: 0 for state in ScanState}
         self.listing_warning: str | None = None
         self.listing_error: str | None = None
         self.selected_path: Path | None = None
@@ -1077,6 +1081,7 @@ class BrowserModel:
         self.current_path = path
         self.view_id += 1
         self.records = {}
+        self._state_counts = {state: 0 for state in ScanState}
         self.listing_warning = None
         self.listing_error = None
         self.selected_path = self._selection_by_directory.get(path_key(path))
@@ -1088,12 +1093,14 @@ class BrowserModel:
         if view_id != self.view_id:
             return []
         self.records = {}
+        self._state_counts = {state: 0 for state in ScanState}
         self.listing_warning = listing.warning
         self.listing_error = listing.error
         for ordinal, entry in enumerate(listing.entries):
             cached = self.cache.get(entry.path)
             result = cached if cached is not None else ScanResult.pending(entry.path)
             self.records[path_key(entry.path)] = DirectoryRecord(entry, result, ordinal)
+            self._state_counts[result.state] += 1
         if (
             self.selected_path is None
             or path_key(self.selected_path) not in self.records
@@ -1147,8 +1154,16 @@ class BrowserModel:
         record = self.records.get(key)
         if record is None:
             return False
+        self._state_counts[record.result.state] -= 1
+        self._state_counts[result.state] += 1
         self.records[key] = DirectoryRecord(record.entry, result, record.ordinal)
         return True
+
+    @property
+    def state_counts(self) -> dict[ScanState, int]:
+        """Return counts of current rows in each scan state."""
+
+        return self._state_counts.copy()
 
     def requests_for_missing_results(
         self,
@@ -1199,10 +1214,10 @@ class ScanManager:
         self.concurrency = concurrency
         self._condition = asyncio.Condition()
         self._pending: dict[str, ScanJob] = {}
+        self._pending_heap: list[tuple[int, int, str]] = []
         self._active: dict[int, tuple[ScanJob, asyncio.Task[ScanResult]]] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._next_request_id = 0
-        self._next_sequence = 0
         self._view_id: int | None = None
         self._closed = False
 
@@ -1241,6 +1256,7 @@ class ScanManager:
                     task.cancel()
             if view_changed:
                 self._pending.clear()
+                self._pending_heap.clear()
             else:
                 for key in tuple(self._pending):
                     if key not in desired_keys:
@@ -1250,17 +1266,29 @@ class ScanManager:
                 for job, _task in self._active.values()
                 if job.view_id == view_id
             }
+            new_heap_entries: list[tuple[int, int, str]] = []
             for key, request in request_map.items():
                 if key in active_paths:
                     continue
+                existing = self._pending.get(key)
+                if existing is not None and existing.priority == request.priority:
+                    continue
                 self._next_request_id += 1
-                self._next_sequence += 1
-                self._pending[key] = ScanJob(
+                job = ScanJob(
                     request_id=self._next_request_id,
                     path=request.path,
                     view_id=view_id,
-                    priority=(request.priority * 1_000_000) + self._next_sequence,
+                    priority=request.priority,
                 )
+                self._pending[key] = job
+                new_heap_entries.append((job.priority, job.request_id, key))
+            if view_changed:
+                self._pending_heap = new_heap_entries
+                heapq.heapify(self._pending_heap)
+            else:
+                for entry in new_heap_entries:
+                    heapq.heappush(self._pending_heap, entry)
+            self._compact_pending_heap()
             self._condition.notify_all()
 
     async def close(self) -> None:
@@ -1271,6 +1299,7 @@ class ScanManager:
                 return
             self._closed = True
             self._pending.clear()
+            self._pending_heap.clear()
             for _job, task in self._active.values():
                 task.cancel()
             self._condition.notify_all()
@@ -1290,11 +1319,9 @@ class ScanManager:
                     await self._condition.wait()
                 if self._closed:
                     return
-                job_key, job = min(
-                    self._pending.items(),
-                    key=lambda item: (item[1].priority, item[1].request_id),
-                )
-                del self._pending[job_key]
+                job = self._pop_pending()
+                if job is None:
+                    continue
 
             scan_task = asyncio.create_task(self.runner.scan(job.path))
             self._active[job.request_id] = (job, scan_task)
@@ -1317,6 +1344,28 @@ class ScanManager:
                     scan_task.cancel()
                     await asyncio.gather(scan_task, return_exceptions=True)
             await self._emit(job, result)
+
+    def _pop_pending(self) -> ScanJob | None:
+        """Pop the next current job, ignoring stale heap entries."""
+
+        while self._pending_heap:
+            _priority, request_id, key = heapq.heappop(self._pending_heap)
+            job = self._pending.get(key)
+            if job is None or job.request_id != request_id:
+                continue
+            del self._pending[key]
+            return job
+        return None
+
+    def _compact_pending_heap(self) -> None:
+        """Rebuild the heap when stale entries exceed the live queue."""
+
+        if len(self._pending_heap) <= max(64, 2 * len(self._pending)):
+            return
+        self._pending_heap = [
+            (job.priority, job.request_id, key) for key, job in self._pending.items()
+        ]
+        heapq.heapify(self._pending_heap)
 
     async def _emit(self, job: ScanJob, result: ScanResult) -> None:
         """Send one update without allowing a UI callback to kill a worker."""
@@ -1433,6 +1482,22 @@ class BarScales:
         """Return the scale for the result's metric source."""
 
         return self.estimate_maximum if result.is_estimate else self.compsize_maximum
+
+    def include(self, result: ScanResult) -> BarScales:
+        """Return scales that include one complete result, if present."""
+
+        if result.state is not ScanState.COMPLETE:
+            return self
+        size = max(
+            result.uncompressed_bytes or 0,
+            result.disk_usage_bytes or 0,
+        )
+        if result.is_estimate:
+            return BarScales(
+                self.compsize_maximum,
+                max(self.estimate_maximum, size),
+            )
+        return BarScales(max(self.compsize_maximum, size), self.estimate_maximum)
 
 
 def render_bar(
@@ -1586,7 +1651,8 @@ class HelpScreen(ModalScreen[None]):
         text = """Compsizer controls
 
 Up/Down, j/k   Move selection
-Home/End        Select first/last row
+Home/End        Select first/last row on page
+PageUp/Down     Change directory page
 Enter, l        Open selected directory
 Backspace, h    Open parent directory
 Tab             Change pane
@@ -1744,6 +1810,8 @@ class CompsizerApp(App[None]):
     CSS = APP_CSS
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("q", "quit_app", "Quit"),
+        Binding("pageup", "previous_page", "Previous page", priority=True),
+        Binding("pagedown", "next_page", "Next page", priority=True),
         Binding("up", "move_up", "Move up"),
         Binding("k", "move_up", "Move up", show=False),
         Binding("down", "move_down", "Move down"),
@@ -1781,6 +1849,8 @@ class CompsizerApp(App[None]):
         self._row_render_lock = asyncio.Lock()
         self._row_refresh_task: asyncio.Task[Any] | None = None
         self._row_refresh_pending = False
+        self._page_index = 0
+        self._bar_scales = BarScales(0, 0)
         self._scan_priority_task: asyncio.Task[Any] | None = None
         self._scan_priority_pending = False
         self._startup_notices: list[str] = []
@@ -1890,6 +1960,8 @@ class CompsizerApp(App[None]):
         if self._view_load_task is not None and not self._view_load_task.done():
             self._view_load_task.cancel()
         view_id = self.model.begin_view(path, refresh=refresh)
+        self._page_index = 0
+        self._bar_scales = BarScales(0, 0)
         self._update_path_label()
         self._update_status("Enumerating directories…")
         self._view_load_task = self._track(self._load_view(view_id, path))
@@ -1914,6 +1986,7 @@ class CompsizerApp(App[None]):
         if self._shutting_down or view_id != self.model.view_id:
             return
         self.model.set_listing(view_id, listing)
+        self._bar_scales = BarScales.from_records(self.model.records.values())
         await self._render_rows()
         if self._shutting_down or not self._ui_ready:
             return
@@ -1928,6 +2001,7 @@ class CompsizerApp(App[None]):
             return
         changed = self.model.apply_scan_update(job, result)
         if changed:
+            self._bar_scales = self._bar_scales.include(result)
             self._schedule_row_render()
         self._update_status()
 
@@ -1996,9 +2070,28 @@ class CompsizerApp(App[None]):
                 await asyncio.sleep(0)
             if self._shutting_down or not self._ui_ready:
                 return
-            records = self.model.sorted_records()
+            all_records = self.model.sorted_records()
+            if self.model.selected_path is not None:
+                selected_key = path_key(self.model.selected_path)
+                selected_global_index = next(
+                    (
+                        index
+                        for index, record in enumerate(all_records)
+                        if path_key(record.entry.path) == selected_key
+                    ),
+                    None,
+                )
+                if selected_global_index is not None:
+                    self._page_index = selected_global_index // DIRECTORY_PAGE_SIZE
+            page_count = max(
+                1,
+                (len(all_records) + DIRECTORY_PAGE_SIZE - 1) // DIRECTORY_PAGE_SIZE,
+            )
+            self._page_index = max(0, min(page_count - 1, self._page_index))
+            page_start = self._page_index * DIRECTORY_PAGE_SIZE
+            records = all_records[page_start : page_start + DIRECTORY_PAGE_SIZE]
             records_by_key = {path_key(record.entry.path): record for record in records}
-            bar_scales = BarScales.from_records(records)
+            bar_scales = self._bar_scales
 
             stale_keys = set(self._row_items) - set(records_by_key)
             for key in stale_keys:
@@ -2075,7 +2168,6 @@ class CompsizerApp(App[None]):
             else:
                 empty_label.update("No child directories.")
             self._update_status()
-            self._schedule_scan_priority_update()
 
     def _schedule_row_render(self) -> None:
         """Coalesce rapid scan updates into one short UI refresh window."""
@@ -2204,16 +2296,16 @@ class CompsizerApp(App[None]):
         if transient:
             status.update(Text(transient))
             return
-        records = tuple(self.model.records.values())
-        counts = {
-            state: sum(record.result.state is state for record in records)
-            for state in ScanState
-        }
+        counts = self.model.state_counts
         parts = [
             f"complete {counts[ScanState.COMPLETE]}",
             f"running {counts[ScanState.RUNNING]}",
             f"pending {counts[ScanState.PENDING]}",
             f"errors {counts[ScanState.ERROR]}",
+            (
+                f"page {self._page_index + 1}/"
+                f"{max(1, (len(self.model.records) + DIRECTORY_PAGE_SIZE - 1) // DIRECTORY_PAGE_SIZE)}"
+            ),
         ]
         parts.extend(self._startup_notices)
         if self.model.listing_error:
@@ -2257,8 +2349,20 @@ class CompsizerApp(App[None]):
             if self._shutting_down or not self._ui_ready:
                 return
             node.remove_children()
-            for entry in listing.entries:
+            entries = listing.entries[:TREE_CHILD_LIMIT]
+            for entry in entries:
                 node.add(self._tree_label(entry.path), entry.path, allow_expand=True)
+            omitted = len(listing.entries) - len(entries)
+            if omitted:
+                node.add(
+                    Text(
+                        f"{omitted} more; use directory pages",
+                        no_wrap=True,
+                        overflow="ellipsis",
+                    ),
+                    None,
+                    allow_expand=False,
+                )
             node.allow_expand = bool(listing.entries)
             self._tree_loaded.add(key)
         finally:
@@ -2326,6 +2430,36 @@ class CompsizerApp(App[None]):
         """Exit the application."""
 
         self.exit()
+
+    def action_previous_page(self) -> None:
+        """Show the previous page of directory rows."""
+
+        self._change_page(-1)
+
+    def action_next_page(self) -> None:
+        """Show the next page of directory rows."""
+
+        self._change_page(1)
+
+    def _change_page(self, delta: int) -> None:
+        """Change pages and select the first row on the new page."""
+
+        if self._shutting_down or not self._ui_ready:
+            return
+        records = self.model.sorted_records()
+        page_count = max(
+            1,
+            (len(records) + DIRECTORY_PAGE_SIZE - 1) // DIRECTORY_PAGE_SIZE,
+        )
+        target_page = max(0, min(page_count - 1, self._page_index + delta))
+        if target_page == self._page_index:
+            return
+        self._page_index = target_page
+        page_start = target_page * DIRECTORY_PAGE_SIZE
+        self.model.select(records[page_start].entry.path)
+        self._schedule_row_render()
+        self._schedule_scan_priority_update()
+        self._update_status()
 
     def action_move_up(self) -> None:
         """Move the focused pane upward."""

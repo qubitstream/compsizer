@@ -55,7 +55,8 @@ with `./compsizer.py`.
 ## Controls
 
 - `Up`/`Down` or `j`/`k`: move the selection
-- `Home`/`End`: select the first or last row
+- `Home`/`End`: select the first or last row on the current page
+- `PageUp`/`PageDown`: show the previous or next directory page
 - `Enter` or `l`: enter the selected directory
 - `Backspace` or `h`: open the parent directory
 - `Tab`: change pane focus
@@ -96,6 +97,9 @@ for numeric sorts; name sorting includes every row in name order.
 - Partial `SIGUSR1` progress is not enabled yet. Rows update when their
   individual scans finish.
 - `compsize -x` prevents scans from crossing filesystem boundaries.
+- The right pane shows up to 100 child directories per page. Use `PageUp` and
+  `PageDown` to browse every row. The tree shows up to 100 children per
+  expanded node; use the right pane to browse additional directories.
 - All direct child directories remain queued for scanning. The selected and
   visible rows are prioritized so useful results appear sooner without making
   the sorted view incomplete.
