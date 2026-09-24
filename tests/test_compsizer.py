@@ -385,6 +385,17 @@ class SortingTests(unittest.TestCase):
         )
 
 
+class RenderingTests(unittest.TestCase):
+    """Test visible graph behavior for complete size measurements."""
+
+    def test_zero_size_complete_bar_is_blank(self) -> None:
+        result = ScanResult(Path("/root/empty"), ScanState.COMPLETE, 0, 0, 0)
+
+        bar = render_bar(result, maximum_size=0, width=8)
+
+        self.assertEqual(bar.plain, " " * 8)
+
+
 class NavigationTests(unittest.TestCase):
     """Test path normalization and direct directory enumeration."""
 
@@ -624,6 +635,21 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(runner.calls, [child, child])
                 await pilot.pause(0.1)
                 self.assertEqual(runner.calls, [child, child])
+
+    async def test_status_diagnostics_fit_within_two_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            app = CompsizerApp(Path(temporary_directory), runner=FakeRunner())
+
+            async with app.run_test(size=(80, 20)) as pilot:
+                await pilot.pause(0.05)
+                app.model.listing_warning = "Long diagnostic. " * 200
+                app._update_status()
+
+                status = app.query_one("#status")
+                rendered = status.render().plain
+                maximum_cells = max(1, status.size.width - 2) * 2
+                self.assertLessEqual(len(rendered), maximum_cells)
+                self.assertTrue(rendered.endswith("…"))
 
     async def test_refresh_reloads_tree_and_invalidates_current_path_cache(
         self,

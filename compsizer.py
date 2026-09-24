@@ -1541,8 +1541,10 @@ def render_bar(
         result.state is ScanState.COMPLETE
         and result.uncompressed_bytes is not None
         and result.disk_usage_bytes is not None
-        and maximum_size > 0
     ):
+        if maximum_size <= 0:
+            bar.append(" " * width)
+            return bar
         logical_fraction = max(0.0, result.uncompressed_bytes / maximum_size)
         disk_fraction = max(0.0, result.disk_usage_bytes / maximum_size)
         logical_cells = min(width, round(width * logical_fraction))
@@ -2327,15 +2329,16 @@ class CompsizerApp(App[None]):
             status.update(Text(transient))
             return
         counts = self.model.state_counts
+        page_count = max(
+            1,
+            (len(self.model.records) + DIRECTORY_PAGE_SIZE - 1) // DIRECTORY_PAGE_SIZE,
+        )
         parts = [
             f"complete {counts[ScanState.COMPLETE]}",
             f"running {counts[ScanState.RUNNING]}",
             f"pending {counts[ScanState.PENDING]}",
             f"errors {counts[ScanState.ERROR]}",
-            (
-                f"page {self._page_index + 1}/"
-                f"{max(1, (len(self.model.records) + DIRECTORY_PAGE_SIZE - 1) // DIRECTORY_PAGE_SIZE)}"
-            ),
+            f"page {self._page_index + 1}/{page_count}",
         ]
         parts.extend(self._startup_notices)
         if self.model.listing_error:
@@ -2348,7 +2351,12 @@ class CompsizerApp(App[None]):
                 parts.append(selected.result.error)
             elif selected is not None and selected.result.warning:
                 parts.append(selected.result.warning)
-        status.update(Text("  ".join(parts)))
+        status_text = "  ".join(parts)
+        content_width = max(1, status.size.width - 2)
+        maximum_cells = content_width * 2
+        if cell_len(status_text) > maximum_cells:
+            status_text = f"{_take_cells(status_text, maximum_cells - 1)}…"
+        status.update(Text(status_text))
 
     @staticmethod
     def _column_header() -> str:
