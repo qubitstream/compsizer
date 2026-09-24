@@ -14,11 +14,26 @@ bounded background scan manager receives them.
 - [`uv`](https://docs.astral.sh/uv/)
 - Textual (installed from the script's PEP 723 metadata)
 - `compsize` available in `PATH`
+- GNU `du` from coreutils available in `PATH` for fallback size estimates
 - A Btrfs filesystem for compression statistics
+- `sudo` available in `PATH` if elevated scan access is needed
 
 `compsize` uses Btrfs ioctls. Depending on the system, those operations may
-require elevated privileges. Compsizer does not invoke `sudo`; it reports
-permission and filesystem errors in the interface.
+require elevated privileges. Compsizer first tries scans as the current user.
+If a scan fails because of permissions, it asks before enabling elevated scans.
+It may ask again if sudo credentials expire. Only `compsize` runs with `sudo`.
+For elevated scans, Compsizer resolves `sudo` and `compsize` from standard
+system directories, not from user-controlled `PATH` entries.
+Your account must be allowed to run `compsize` with sudo. Sudo handles any
+password prompt while the interface temporarily releases the terminal.
+Compsizer does not read or store the password, and the interface itself does
+not run as root. If authorization is declined or unavailable, the browser
+stays open and shows GNU `du` estimates for apparent size and allocated space.
+These estimates do not include Btrfs extent statistics. If `compsize` is
+missing, the browser stays open and reports scan errors.
+
+If the starting path is on another filesystem, Compsizer shows a warning but
+continues. A child directory can be a Btrfs mount.
 
 ## Run
 
@@ -50,20 +65,25 @@ with `./compsizer.py`.
 - `?`: show help
 - `q`: quit
 
-Size sorting uses uncompressed bytes, with the largest directory first.
-Ratio sorting uses `disk usage / uncompressed size`, with the lowest ratio
-first. Savings sorting uses `uncompressed size - disk usage`, with the
-largest difference first. Name sorting uses case-insensitive directory names.
-Pending and error rows remain below rows with known values for the numeric
-sorts; name sorting includes every row in name order.
+Size sorting uses uncompressed bytes or fallback apparent size, with the
+largest directory first. Ratio sorting uses exact `compsize` results, with
+the lowest ratio first. Savings sorting uses exact `compsize` results, with
+the largest difference first. Fallback rows sort after exact results for
+ratio and savings modes. Name sorting uses case-insensitive directory names.
+Pending and error rows remain below rows with known values for numeric sorts;
+name sorting includes every row in name order.
 
 ## Data and limitations
 
 - Version 1 lists directories only.
-- The visible size is `compsize`'s uncompressed extent size. It is not the
-  apparent size reported by the `Referenced` column.
-- The bar uses a solid glyph for disk usage and a separate glyph for the
-  difference from uncompressed extent usage.
+- With `compsize`, the visible size is the uncompressed extent size. It is not
+  the apparent size reported by the `Referenced` column. After sudo is
+  declined, the visible size is `du`'s apparent size.
+- The bar uses a solid glyph for allocated space and a separate glyph for the
+  difference to the size baseline. For fallback rows, the Ratio/Used column
+  shows estimated allocated bytes with a `~` prefix.
+- `du` estimates are not Btrfs extent statistics. Shared extents can make
+  allocated-space totals differ from unique physical usage.
 - Independent child scans are not additive. Btrfs reflinks, deduplication,
   shared extents, and extent waste can make sibling measurements overlap.
 - The in-memory cache lasts for one process. It is not persistent and has no

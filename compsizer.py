@@ -14,8 +14,11 @@ import argparse
 import asyncio
 import logging
 import os
+import re
+import shutil
+import subprocess
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from fractions import Fraction
 from pathlib import Path
@@ -24,7 +27,7 @@ from typing import Any, ClassVar, Protocol
 from rich.cells import cell_len
 from rich.text import Text
 from textual import events
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
@@ -39,9 +42,11 @@ LOGGER = logging.getLogger("compsizer")
 DEFAULT_CONCURRENCY = 2
 MAX_DIAGNOSTIC_LENGTH = 500
 ROW_REFRESH_DELAY = 0.02
+# Do not resolve elevated commands through the user's environment PATH.
+SYSTEM_EXECUTABLE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 BAR_STYLE = "green"
 NAME_COLUMN_WIDTH = 26
-RATIO_COLUMN_WIDTH = 9
+RATIO_COLUMN_WIDTH = 11
 SIZE_COLUMN_WIDTH = 13
 
 
@@ -113,7 +118,7 @@ class ParsedCompsizeReport:
 
 @dataclass(frozen=True, slots=True)
 class ScanResult:
-    """Represent the current compression scan state for one path."""
+    """Represent measured or estimated size statistics for one path."""
 
     path: Path
     state: ScanState
@@ -124,12 +129,17 @@ class ScanResult:
     warning: str | None = None
     error: str | None = None
     exit_code: int | None = None
+    is_estimate: bool = False
 
     @property
     def ratio(self) -> float | None:
-        """Return disk usage divided by uncompressed size."""
+        """Return the exact compsize disk-usage ratio, when available."""
 
-        if self.disk_usage_bytes is None or self.uncompressed_bytes in (None, 0):
+        if (
+            self.is_estimate
+            or self.disk_usage_bytes is None
+            or self.uncompressed_bytes in (None, 0)
+        ):
             return None
         return self.disk_usage_bytes / self.uncompressed_bytes
 
@@ -137,15 +147,23 @@ class ScanResult:
     def ratio_fraction(self) -> Fraction | None:
         """Return the exact ratio used for sorting, when available."""
 
-        if self.disk_usage_bytes is None or self.uncompressed_bytes in (None, 0):
+        if (
+            self.is_estimate
+            or self.disk_usage_bytes is None
+            or self.uncompressed_bytes in (None, 0)
+        ):
             return None
         return Fraction(self.disk_usage_bytes, self.uncompressed_bytes)
 
     @property
     def savings_bytes(self) -> int | None:
-        """Return the byte difference between uncompressed and disk usage."""
+        """Return exact savings when complete compression statistics exist."""
 
-        if self.disk_usage_bytes is None or self.uncompressed_bytes is None:
+        if (
+            self.is_estimate
+            or self.disk_usage_bytes is None
+            or self.uncompressed_bytes is None
+        ):
             return None
         return self.uncompressed_bytes - self.disk_usage_bytes
 
@@ -187,6 +205,15 @@ class ScanResult:
             error=message,
             exit_code=exit_code,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _CompsizeAttempt:
+    """Keep a scan result with the reason an attempt may be retried."""
+
+    result: ScanResult
+    permission_required: bool = False
+    sudo_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +279,54 @@ def absolute_child_path(parent: Path, name: str) -> Path:
     """Build an absolute child path without resolving symlinks."""
 
     return Path(os.path.abspath(os.path.join(os.fspath(parent), name)))
+
+
+class FilesystemDetector:
+    """Read filesystem types from Linux mount information."""
+
+    @staticmethod
+    def read_mountinfo() -> str | None:
+        """Read the current process mount table when it is available."""
+
+        try:
+            return Path("/proc/self/mountinfo").read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return None
+
+    @staticmethod
+    def filesystem_type(path: Path, mountinfo: str) -> str | None:
+        """Return the filesystem type mounted at ``path``, if it is known."""
+
+        best_mount: tuple[int, int, str] | None = None
+        for line in mountinfo.splitlines():
+            mount_fields, separator, filesystem_fields = line.partition(" - ")
+            if not separator:
+                continue
+            mount_tokens = mount_fields.split()
+            filesystem_tokens = filesystem_fields.split()
+            if len(mount_tokens) < 5 or not filesystem_tokens:
+                continue
+            try:
+                mount_id = int(mount_tokens[0])
+            except ValueError:
+                continue
+            mountpoint_text = re.sub(
+                r"\\([0-7]{3})",
+                lambda match: chr(int(match.group(1), 8)),
+                mount_tokens[4],
+            )
+            mountpoint = Path(mountpoint_text)
+            try:
+                path.relative_to(mountpoint)
+            except ValueError:
+                continue
+            candidate = (len(mountpoint.parts), mount_id, filesystem_tokens[0])
+            if best_mount is None or candidate[:2] > best_mount[:2]:
+                best_mount = candidate
+        return best_mount[2] if best_mount is not None else None
 
 
 def enumerate_directories(path: Path) -> DirectoryListing:
@@ -402,33 +477,362 @@ class ScanRunner(Protocol):
         """Stop active scanner resources."""
 
 
-class CompsizeRunner:
-    """Run ``compsize`` with argument-safe asynchronous subprocesses."""
+@dataclass(frozen=True, slots=True)
+class _DuMeasurement:
+    """Keep one ``du`` size with any diagnostics from that traversal."""
 
-    def __init__(self, executable: str = "compsize") -> None:
+    size_bytes: int | None
+    warning: str | None = None
+    error: str | None = None
+
+
+class DuRunner:
+    """Measure apparent and allocated directory sizes with GNU ``du``."""
+
+    def __init__(self, executable: str = "du") -> None:
         self.executable = executable
         self._processes: set[asyncio.subprocess.Process] = set()
 
     async def scan(self, path: Path) -> ScanResult:
-        """Run a complete scan for ``path`` and convert failures to results."""
+        """Return ``du`` size estimates for one directory."""
 
+        allocated = await self._measure(path, apparent=False)
+        apparent = await self._measure(path, apparent=True)
+        messages: list[str] = []
+        for label, measurement in (
+            ("allocated space", allocated),
+            ("apparent size", apparent),
+        ):
+            if measurement.error:
+                messages.append(f"Could not measure {label}: {measurement.error}")
+            if measurement.warning:
+                messages.append(measurement.warning)
+
+        if allocated.size_bytes is None and apparent.size_bytes is None:
+            detail = "; ".join(messages) or "du did not return a size."
+            return ScanResult.error_result(path, detail)
+
+        return ScanResult(
+            path=path,
+            state=ScanState.COMPLETE,
+            disk_usage_bytes=allocated.size_bytes,
+            uncompressed_bytes=apparent.size_bytes,
+            warning=" ".join(messages) or None,
+            is_estimate=True,
+        )
+
+    async def _measure(self, path: Path, *, apparent: bool) -> _DuMeasurement:
+        """Run one allocated-space or apparent-size traversal."""
+
+        command = [
+            self.executable,
+            "--summarize",
+            "--block-size=1",
+            "--one-file-system",
+        ]
+        if apparent:
+            command.append("--apparent-size")
+        command.extend(("--", os.fspath(path)))
+        environment = os.environ.copy()
+        environment["LC_ALL"] = "C"
         try:
             process = await asyncio.create_subprocess_exec(
-                self.executable,
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=environment,
+            )
+        except FileNotFoundError:
+            return _DuMeasurement(
+                None,
+                error=f"{self.executable!r} was not found in PATH.",
+            )
+        except OSError as exc:
+            return _DuMeasurement(None, error=f"Unable to start du: {exc}")
+
+        self._processes.add(process)
+        try:
+            stdout_bytes, stderr_bytes = await process.communicate()
+        except asyncio.CancelledError:
+            await self._terminate_process(process)
+            raise
+        finally:
+            self._processes.discard(process)
+
+        size_bytes = self._parse_size(stdout_bytes)
+        diagnostic = diagnostic_text(stderr_bytes.decode(errors="replace")) or None
+        exit_code = process.returncode
+        if size_bytes is None:
+            detail = diagnostic or "du returned no size."
+            if exit_code not in (None, 0) and diagnostic is None:
+                detail = f"du exited with status {exit_code} without a size."
+            return _DuMeasurement(None, error=detail)
+        if exit_code not in (None, 0) and diagnostic is None:
+            diagnostic = f"du exited with status {exit_code}; totals may be partial."
+        return _DuMeasurement(size_bytes, warning=diagnostic)
+
+    @staticmethod
+    def _parse_size(stdout: bytes) -> int | None:
+        """Parse the byte count before ``du``'s tab-separated path."""
+
+        first_line = stdout.partition(b"\n")[0]
+        size_text, separator, _path = first_line.partition(b"\t")
+        if not separator or not size_text.isdigit():
+            return None
+        return int(size_text)
+
+    async def close(self) -> None:
+        """Terminate active ``du`` processes."""
+
+        processes = tuple(self._processes)
+        if processes:
+            await asyncio.gather(
+                *(self._terminate_process(process) for process in processes),
+                return_exceptions=True,
+            )
+
+    @staticmethod
+    async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+        """Terminate one ``du`` process and drain its pipes."""
+
+        if process.returncode is None:
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=1.0)
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                process.kill()
+            await process.communicate()
+
+
+PrivilegeAuthorization = Callable[[Sequence[str]], Awaitable[bool]]
+
+
+class CompsizeRunner:
+    """Run ``compsize`` and request elevation only when a scan needs it."""
+
+    def __init__(
+        self,
+        executable: str = "compsize",
+        *,
+        sudo_executable: str = "sudo",
+        authorization_callback: PrivilegeAuthorization | None = None,
+        fallback_runner: ScanRunner | None = None,
+    ) -> None:
+        self.executable = executable
+        self.sudo_executable = sudo_executable
+        self.authorization_callback = authorization_callback
+        self.fallback_runner: ScanRunner = (
+            fallback_runner if fallback_runner is not None else DuRunner()
+        )
+        self._processes: set[asyncio.subprocess.Process] = set()
+        self._running_as_root: bool = os.geteuid() == 0
+        self._sudo_enabled: bool = False
+        self._authorization_declined: bool = False
+        self._authorization_lock: asyncio.Lock = asyncio.Lock()
+
+    async def scan(self, path: Path) -> ScanResult:
+        """Scan ``path``, offering one sudo prompt after a permission failure."""
+
+        if self._running_as_root:
+            return (await self._run_scan(path, elevated=False)).result
+
+        if self._authorization_declined:
+            return await self._fallback_scan(
+                path,
+                "Elevated scans were declined; showing du estimates.",
+            )
+
+        if self._sudo_enabled:
+            attempt = await self._run_scan(path, elevated=True)
+            if not attempt.sudo_failed:
+                return attempt.result
+            return await self._reauthorize(path)
+
+        attempt = await self._run_scan(path, elevated=False)
+        if not attempt.permission_required:
+            return attempt.result
+        return await self._enable_elevated_scans(path)
+
+    def reset_privilege_decision(self) -> None:
+        """Allow another authorization prompt after an explicit refresh."""
+
+        self._authorization_declined = False
+
+    async def _enable_elevated_scans(self, path: Path) -> ScanResult:
+        """Retry one permission-denied scan as root and authorize if needed."""
+
+        async with self._authorization_lock:
+            if self._sudo_enabled:
+                attempt = await self._run_scan(path, elevated=True)
+                if not attempt.sudo_failed:
+                    return attempt.result
+                self._sudo_enabled = False
+                self._authorization_declined = False
+                return await self._request_authorization(path)
+
+            if self._authorization_declined:
+                return await self._fallback_scan(
+                    path,
+                    "Elevated scans were declined; showing du estimates.",
+                )
+
+            return await self._request_authorization(path)
+
+    async def _reauthorize(self, path: Path) -> ScanResult:
+        """Ask for authorization again when sudo credentials have expired."""
+
+        async with self._authorization_lock:
+            if self._sudo_enabled:
+                attempt = await self._run_scan(path, elevated=True)
+                if not attempt.sudo_failed:
+                    return attempt.result
+                self._sudo_enabled = False
+                self._authorization_declined = False
+            if self._authorization_declined:
+                return await self._fallback_scan(
+                    path,
+                    "Sudo authorization was declined; showing du estimates.",
+                )
+            return await self._request_authorization(path)
+
+    async def _request_authorization(self, path: Path) -> ScanResult:
+        """Prompt once, then retry with sudo without an in-app password prompt."""
+
+        command = self._authorization_command()
+        if command is None:
+            self._authorization_declined = True
+            return await self._fallback_scan(
+                path,
+                "Sudo or compsize was not found in trusted system directories; "
+                "showing du estimates.",
+            )
+        if self.authorization_callback is None:
+            self._authorization_declined = True
+            return await self._fallback_scan(
+                path,
+                "Elevated scans are unavailable; showing du estimates.",
+            )
+
+        if not await self.authorization_callback(command):
+            self._authorization_declined = True
+            return await self._fallback_scan(
+                path,
+                "Sudo authorization was declined or failed; showing du estimates.",
+            )
+
+        attempt = await self._run_scan(path, elevated=True)
+        if attempt.sudo_failed:
+            self._authorization_declined = True
+            return await self._fallback_scan(
+                path,
+                "Sudo could not run compsize; showing du estimates.",
+            )
+
+        self._sudo_enabled = True
+        return attempt.result
+
+    async def _fallback_scan(self, path: Path, reason: str) -> ScanResult:
+        """Return unprivileged ``du`` estimates after elevation is unavailable."""
+
+        result = await self.fallback_runner.scan(path)
+        if result.state is ScanState.ERROR:
+            detail = result.error or "du could not measure this directory."
+            return replace(result, error=f"{reason} {detail}")
+        warning = " ".join(part for part in (reason, result.warning) if part)
+        return replace(result, warning=warning)
+
+    def _authorization_command(self) -> list[str] | None:
+        """Build a sudo command that can authenticate without scanning data."""
+
+        sudo_path = self._trusted_executable_path(self.sudo_executable)
+        executable_path = self._trusted_executable_path(self.executable)
+        if sudo_path is None or executable_path is None:
+            return None
+        return [sudo_path, "--", executable_path, "--help"]
+
+    @staticmethod
+    def _trusted_executable_path(executable: str) -> str | None:
+        """Resolve an elevated command from system paths, not a user PATH."""
+
+        candidate = shutil.which(executable, path=SYSTEM_EXECUTABLE_PATH)
+        if candidate is None:
+            return None
+        try:
+            resolved = Path(candidate).resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        if not resolved.is_file():
+            return None
+        for directory in SYSTEM_EXECUTABLE_PATH.split(os.pathsep):
+            try:
+                trusted_directory = Path(directory).resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if resolved.is_relative_to(trusted_directory):
+                return os.fspath(resolved)
+        return None
+
+    async def _run_scan(self, path: Path, *, elevated: bool) -> _CompsizeAttempt:
+        """Run one scan and classify permission and sudo failures."""
+
+        command = [self.executable, "-b", "-x", "--", os.fspath(path)]
+        if self._running_as_root and not elevated:
+            executable_path = self._trusted_executable_path(self.executable)
+            if executable_path is None:
+                message = (
+                    f"Unable to run {self.executable!r}: executable not found "
+                    "in trusted system directories."
+                )
+                return _CompsizeAttempt(ScanResult.error_result(path, message))
+            command = [executable_path, "-b", "-x", "--", os.fspath(path)]
+        if elevated:
+            sudo_path = self._trusted_executable_path(self.sudo_executable)
+            executable_path = self._trusted_executable_path(self.executable)
+            if sudo_path is None or executable_path is None:
+                message = (
+                    f"Unable to run elevated compsize: {self.sudo_executable!r} "
+                    f"or {self.executable!r} was not found in trusted system "
+                    "directories."
+                )
+                return _CompsizeAttempt(
+                    ScanResult.error_result(path, message), sudo_failed=True
+                )
+            command = [
+                sudo_path,
+                "-n",
+                "--",
+                executable_path,
                 "-b",
                 "-x",
                 "--",
                 os.fspath(path),
+            ]
+        environment = os.environ.copy()
+        environment["LC_ALL"] = "C"
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=environment,
             )
         except FileNotFoundError:
-            return ScanResult.error_result(
-                path,
-                f"Unable to run {self.executable!r}: executable not found in PATH.",
+            message = (
+                f"Unable to run elevated compsize: {self.sudo_executable!r} "
+                "was not found in PATH."
+                if elevated
+                else f"Unable to run {self.executable!r}: executable not found in PATH."
+            )
+            return _CompsizeAttempt(
+                ScanResult.error_result(path, message), sudo_failed=elevated
             )
         except OSError as exc:
-            return ScanResult.error_result(path, f"Unable to start compsize: {exc}")
+            return _CompsizeAttempt(
+                ScanResult.error_result(path, f"Unable to start compsize: {exc}"),
+                sudo_failed=elevated,
+            )
 
         self._processes.add(process)
         try:
@@ -442,6 +846,20 @@ class CompsizeRunner:
         stdout = stdout_bytes.decode(errors="replace")
         stderr = stderr_bytes.decode(errors="replace")
         exit_code = process.returncode
+        sudo_failed = (
+            elevated and exit_code not in (None, 0) and self._is_sudo_failure(stderr)
+        )
+        if sudo_failed:
+            return _CompsizeAttempt(
+                ScanResult.error_result(
+                    path,
+                    diagnostic_text(stderr) or "Sudo could not run compsize.",
+                    exit_code=exit_code,
+                ),
+                sudo_failed=True,
+            )
+
+        permission_required = self._has_permission_error(stderr)
         try:
             report = parse_compsize_output(stdout, stderr)
         except CompsizeParseError as exc:
@@ -449,43 +867,84 @@ class CompsizeRunner:
             message = str(exc)
             if detail and detail not in message:
                 message = f"{message} ({detail})"
-            return ScanResult.error_result(path, message, exit_code=exit_code)
+            return _CompsizeAttempt(
+                ScanResult.error_result(path, message, exit_code=exit_code),
+                permission_required=permission_required,
+            )
 
         if report.empty:
-            return ScanResult(
-                path=path,
-                state=ScanState.COMPLETE,
-                disk_usage_bytes=0,
-                uncompressed_bytes=0,
-                referenced_bytes=0,
-                warning=report.warning,
-                exit_code=exit_code,
+            return _CompsizeAttempt(
+                ScanResult(
+                    path=path,
+                    state=ScanState.COMPLETE,
+                    disk_usage_bytes=0,
+                    uncompressed_bytes=0,
+                    referenced_bytes=0,
+                    warning=report.warning,
+                    exit_code=exit_code,
+                ),
+                permission_required=permission_required,
+            )
+        if permission_required:
+            return _CompsizeAttempt(
+                ScanResult(
+                    path=path,
+                    state=ScanState.ERROR,
+                    disk_usage_bytes=report.disk_usage_bytes,
+                    uncompressed_bytes=report.uncompressed_bytes,
+                    referenced_bytes=report.referenced_bytes,
+                    compression_types=report.compression_types,
+                    warning=report.warning,
+                    error=diagnostic_text(stderr),
+                    exit_code=exit_code,
+                ),
+                permission_required=True,
             )
         if exit_code not in (None, 0):
             error = (
                 diagnostic_text(stderr) or f"compsize exited with status {exit_code}."
             )
-            return ScanResult(
+            return _CompsizeAttempt(
+                ScanResult(
+                    path=path,
+                    state=ScanState.ERROR,
+                    disk_usage_bytes=report.disk_usage_bytes,
+                    uncompressed_bytes=report.uncompressed_bytes,
+                    referenced_bytes=report.referenced_bytes,
+                    compression_types=report.compression_types,
+                    warning=report.warning,
+                    error=error,
+                    exit_code=exit_code,
+                )
+            )
+        return _CompsizeAttempt(
+            ScanResult(
                 path=path,
-                state=ScanState.ERROR,
+                state=ScanState.COMPLETE,
                 disk_usage_bytes=report.disk_usage_bytes,
                 uncompressed_bytes=report.uncompressed_bytes,
                 referenced_bytes=report.referenced_bytes,
                 compression_types=report.compression_types,
                 warning=report.warning,
-                error=error,
                 exit_code=exit_code,
             )
-        return ScanResult(
-            path=path,
-            state=ScanState.COMPLETE,
-            disk_usage_bytes=report.disk_usage_bytes,
-            uncompressed_bytes=report.uncompressed_bytes,
-            referenced_bytes=report.referenced_bytes,
-            compression_types=report.compression_types,
-            warning=report.warning,
-            exit_code=exit_code,
         )
+
+    @staticmethod
+    def _has_permission_error(diagnostic: str) -> bool:
+        """Return whether a compsize diagnostic reports a permission denial."""
+
+        normalized = diagnostic.casefold()
+        return (
+            "operation not permitted" in normalized or "permission denied" in normalized
+        )
+
+    @staticmethod
+    def _is_sudo_failure(diagnostic: str) -> bool:
+        """Recognize messages emitted by sudo before it runs compsize."""
+
+        normalized = diagnostic.lstrip().casefold()
+        return normalized.startswith("sudo:") or "not allowed to execute" in normalized
 
     async def close(self) -> None:
         """Terminate all subprocesses owned by this runner."""
@@ -496,6 +955,7 @@ class CompsizeRunner:
                 *(self._terminate_process(process) for process in processes),
                 return_exceptions=True,
             )
+        await self.fallback_runner.close()
 
     @staticmethod
     async def _terminate_process(process: asyncio.subprocess.Process) -> None:
@@ -934,7 +1394,7 @@ def format_bytes(value: int | None) -> str:
 
 
 def format_ratio(ratio: float | None) -> str:
-    """Format a compression ratio as a percentage."""
+    """Format a disk-usage ratio as a percentage."""
 
     if ratio is None:
         return "—"
@@ -943,10 +1403,10 @@ def format_ratio(ratio: float | None) -> str:
 
 def render_bar(
     result: ScanResult,
-    maximum_uncompressed: int,
+    maximum_size: int,
     width: int,
 ) -> Text:
-    """Render compressed usage and logical savings in one bar."""
+    """Render allocated usage and the difference to the size baseline."""
 
     bar = Text()
     if width <= 0:
@@ -955,15 +1415,15 @@ def render_bar(
         result.state is ScanState.COMPLETE
         and result.uncompressed_bytes is not None
         and result.disk_usage_bytes is not None
-        and maximum_uncompressed > 0
+        and maximum_size > 0
     ):
-        logical_fraction = max(0.0, result.uncompressed_bytes / maximum_uncompressed)
-        disk_fraction = max(0.0, result.disk_usage_bytes / maximum_uncompressed)
+        logical_fraction = max(0.0, result.uncompressed_bytes / maximum_size)
+        disk_fraction = max(0.0, result.disk_usage_bytes / maximum_size)
         logical_cells = min(width, round(width * logical_fraction))
-        disk_cells = min(logical_cells, round(width * disk_fraction))
+        disk_cells = min(width, round(width * disk_fraction))
         bar.append("█" * disk_cells, style=BAR_STYLE)
         bar.append("░" * max(0, logical_cells - disk_cells), style=BAR_STYLE)
-        bar.append(" " * max(0, width - logical_cells))
+        bar.append(" " * max(0, width - max(logical_cells, disk_cells)))
         return bar
     if result.state is ScanState.ERROR:
         bar.append("!" * width, style="red")
@@ -975,17 +1435,17 @@ def render_bar(
 class DirectoryRow(Static):
     """Render one directory record with responsive columns."""
 
-    def __init__(self, record: DirectoryRecord, maximum_uncompressed: int) -> None:
+    def __init__(self, record: DirectoryRecord, maximum_size: int) -> None:
         super().__init__(markup=False, classes="directory-row")
         self.record = record
-        self.maximum_uncompressed = maximum_uncompressed
+        self.maximum_size = maximum_size
         self.tooltip = record.result.error or record.result.warning
 
-    def update_record(self, record: DirectoryRecord, maximum_uncompressed: int) -> None:
+    def update_record(self, record: DirectoryRecord, maximum_size: int) -> None:
         """Replace row data and refresh its display."""
 
         self.record = record
-        self.maximum_uncompressed = maximum_uncompressed
+        self.maximum_size = maximum_size
         self.tooltip = record.result.error or record.result.warning
         self.refresh()
 
@@ -1005,19 +1465,25 @@ class DirectoryRow(Static):
         graph_width = max(1, width - fixed_width)
         result = self.record.result
         name = truncate_middle(self.record.entry.name, NAME_COLUMN_WIDTH)
-        ratio = format_ratio(result.ratio)
+        ratio_or_used = (
+            format_bytes(result.disk_usage_bytes)
+            if result.is_estimate
+            else format_ratio(result.ratio)
+        )
+        if result.is_estimate and result.disk_usage_bytes is not None:
+            ratio_or_used = f"~{ratio_or_used}"
         size = format_bytes(result.uncompressed_bytes)
         if result.state is ScanState.ERROR and not result.has_statistics:
-            ratio = "error"
+            ratio_or_used = "error"
             size = "error"
 
         line = Text()
         line.append(pad_right(name, NAME_COLUMN_WIDTH))
         line.append(" ")
-        line.append(render_bar(result, self.maximum_uncompressed, graph_width))
+        line.append(render_bar(result, self.maximum_size, graph_width))
         line.append(" ")
         ratio_start = len(line.plain)
-        line.append(pad_left(ratio, RATIO_COLUMN_WIDTH))
+        line.append(pad_left(ratio_or_used, RATIO_COLUMN_WIDTH))
         line.append(" ")
         size_start = len(line.plain)
         line.append(pad_left(size, SIZE_COLUMN_WIDTH))
@@ -1092,9 +1558,12 @@ r               Refresh current directory and rescan
 ?               Show this help
 q               Quit
 
-Bars show disk usage (█) and the difference from uncompressed
-extent usage (░) in the same color. The size column shows
-uncompressed bytes.
+Bars show allocated usage (█) and the difference to the size
+baseline (░). The size column shows uncompressed extent bytes for
+compsize results. When elevated scans are unavailable, du provides
+apparent-size and allocated-space estimates; the Ratio/Used column shows
+estimated allocated bytes with a ~ prefix.
+These estimates are not Btrfs extent statistics.
 Independent directory scans are not additive because Btrfs
 reflinks and shared extents may overlap.
 
@@ -1105,6 +1574,57 @@ Esc             Close help"""
         """Close the help dialog."""
 
         self.dismiss(None)
+
+
+class ElevatedScanPrompt(ModalScreen[bool]):
+    """Ask whether to authorize elevated ``compsize`` scans."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("y", "authorize", "Authorize", show=False),
+        Binding("enter", "authorize", "Authorize", show=False, priority=True),
+        Binding("n", "decline", "Continue without", show=False),
+        Binding("escape", "decline", "Continue without", show=False),
+    ]
+
+    CSS = """
+    ElevatedScanPrompt {
+        align: center middle;
+    }
+    #elevated-dialog {
+        width: 72;
+        max-width: 92%;
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $surface;
+    }
+    #elevated-text {
+        width: 1fr;
+        height: auto;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        """Compose the one-time elevated-scan consent message."""
+
+        text = (
+            "compsize needs permission to read Btrfs extent data.\n\n"
+            "Allow Compsizer to run compsize as root? Sudo may ask for your "
+            "password, and your account must be allowed to run this command. "
+            "Compsizer does not read or store the password.\n\n"
+            "Y or Enter: authorize    N or Esc: continue without statistics"
+        )
+        yield Container(Static(text, id="elevated-text"), id="elevated-dialog")
+
+    def action_authorize(self) -> None:
+        """Confirm elevated scans."""
+
+        self.dismiss(True)
+
+    def action_decline(self) -> None:
+        """Continue without elevated scans."""
+
+        self.dismiss(False)
 
 
 APP_CSS = """
@@ -1207,7 +1727,11 @@ class CompsizerApp(App[None]):
         super().__init__()
         self.cache = ResultCache()
         self.model = BrowserModel(initial_path, self.cache)
-        self.runner = runner if runner is not None else CompsizeRunner()
+        self.runner = (
+            runner
+            if runner is not None
+            else CompsizeRunner(authorization_callback=self._authorize_elevated_scans)
+        )
         self.manager = ScanManager(self.runner, self._on_scan_update)
         self._tasks: set[asyncio.Task[Any]] = set()
         self._view_load_task: asyncio.Task[Any] | None = None
@@ -1221,6 +1745,7 @@ class CompsizerApp(App[None]):
         self._row_refresh_pending = False
         self._scan_priority_task: asyncio.Task[Any] | None = None
         self._scan_priority_pending = False
+        self._startup_notices: list[str] = []
         self._ui_ready = False
         self._shutting_down = False
 
@@ -1265,16 +1790,42 @@ class CompsizerApp(App[None]):
     async def _initialize(self) -> None:
         """Start the scan manager and schedule initial filesystem work."""
 
+        initial_path = self.model.current_path
         await self.manager.start()
         if self._shutting_down:
             return
-        self._navigate_to(self.model.current_path)
+        self._navigate_to(initial_path)
         if self._shutting_down:
             return
         tree = self.query_one("#directory-tree", Tree)
         tree.root.expand()
         self._track(self._load_tree_children(tree.root))
         self.set_focus(self.query_one("#directory-list", ListView))
+        self._track(self._check_startup_environment(initial_path))
+
+    async def _check_startup_environment(self, initial_path: Path) -> None:
+        """Check optional scanner access without delaying initial navigation."""
+
+        mountinfo = await asyncio.to_thread(FilesystemDetector.read_mountinfo)
+        if self._shutting_down:
+            return
+        if mountinfo is not None:
+            filesystem_type = FilesystemDetector.filesystem_type(
+                initial_path,
+                mountinfo,
+            )
+            if filesystem_type is not None and filesystem_type.casefold() != "btrfs":
+                self._startup_notices.append(
+                    f"Initial path is on {filesystem_type}; Btrfs child mounts can "
+                    "still be browsed."
+                )
+        if isinstance(self.runner, CompsizeRunner):
+            executable = await asyncio.to_thread(shutil.which, self.runner.executable)
+            if executable is None:
+                self._startup_notices.append(
+                    "compsize was not found in PATH; compression statistics are unavailable."
+                )
+        self._update_status()
 
     def _track(self, coroutine: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """Track an application task for clean shutdown."""
@@ -1342,6 +1893,55 @@ class CompsizerApp(App[None]):
             self._schedule_row_render()
         self._update_status()
 
+    async def _authorize_elevated_scans(self, command: Sequence[str]) -> bool:
+        """Confirm root scans and let sudo prompt while the TUI is suspended."""
+
+        if self._shutting_down or not self._ui_ready:
+            return False
+
+        result: asyncio.Future[bool | None] = asyncio.get_running_loop().create_future()
+
+        def set_result(value: bool | None) -> None:
+            """Receive the consent screen result."""
+
+            if not result.done():
+                result.set_result(value)
+
+        prompt = ElevatedScanPrompt()
+        self.push_screen(prompt, callback=set_result)
+        try:
+            approved = await result
+        except asyncio.CancelledError:
+            if self.screen is prompt:
+                self.pop_screen()
+            raise
+        if not approved:
+            return False
+
+        try:
+            with self.suspend():
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=None,
+                    stdout=subprocess.DEVNULL,
+                )
+                try:
+                    await process.wait()
+                except asyncio.CancelledError:
+                    if process.returncode is None:
+                        process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if process.returncode is None:
+                            process.kill()
+                        await process.wait()
+                    raise
+        except (OSError, SuspendNotSupported) as exc:
+            LOGGER.warning("Unable to authorize elevated compsize scans: %s", exc)
+            return False
+        return process.returncode == 0
+
     async def _render_rows(self) -> None:
         """Update row widgets in place and move only rows that changed order."""
 
@@ -1360,9 +1960,12 @@ class CompsizerApp(App[None]):
                 return
             records = self.model.sorted_records()
             records_by_key = {path_key(record.entry.path): record for record in records}
-            maximum_uncompressed = max(
+            maximum_size = max(
                 (
-                    record.result.uncompressed_bytes or 0
+                    max(
+                        record.result.uncompressed_bytes or 0,
+                        record.result.disk_usage_bytes or 0,
+                    )
                     for record in records
                     if record.result.state is ScanState.COMPLETE
                 ),
@@ -1380,13 +1983,13 @@ class CompsizerApp(App[None]):
             for key, record in records_by_key.items():
                 row = self._row_widgets.get(key)
                 if row is None:
-                    row = DirectoryRow(record, maximum_uncompressed)
+                    row = DirectoryRow(record, maximum_size)
                     self._row_widgets[key] = row
                     item = ListItem(row)
                     self._row_items[key] = item
                     new_items.append(item)
                 else:
-                    row.update_record(record, maximum_uncompressed)
+                    row.update_record(record, maximum_size)
 
             if new_items:
                 try:
@@ -1584,6 +2187,7 @@ class CompsizerApp(App[None]):
             f"pending {counts[ScanState.PENDING]}",
             f"errors {counts[ScanState.ERROR]}",
         ]
+        parts.extend(self._startup_notices)
         if self.model.listing_error:
             parts.append(self.model.listing_error)
         elif self.model.listing_warning:
@@ -1600,7 +2204,7 @@ class CompsizerApp(App[None]):
     def _column_header() -> str:
         """Return the fixed-column header shown above the rows."""
 
-        return f"{pad_right('Directory', NAME_COLUMN_WIDTH)} {'Bar':<{10}} {pad_left('Ratio', RATIO_COLUMN_WIDTH)} {pad_left('Uncompressed', SIZE_COLUMN_WIDTH)}"
+        return f"{pad_right('Directory', NAME_COLUMN_WIDTH)} {'Bar':<{10}} {pad_left('Ratio/Used', RATIO_COLUMN_WIDTH)} {pad_left('Size', SIZE_COLUMN_WIDTH)}"
 
     @staticmethod
     def _tree_label(path: Path) -> Text:
@@ -1779,6 +2383,8 @@ class CompsizerApp(App[None]):
     def action_refresh_view(self) -> None:
         """Re-enumerate and rescan the current directory."""
 
+        if isinstance(self.runner, CompsizeRunner):
+            self.runner.reset_privilege_decision()
         self._navigate_to(self.model.current_path, refresh=True)
 
     def action_show_help(self) -> None:

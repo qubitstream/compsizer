@@ -1,8 +1,11 @@
 import asyncio
 import os
+import shlex
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 from textual.widgets import ListView
 
@@ -15,7 +18,10 @@ from compsizer import (
     DirectoryListing,
     DirectoryRecord,
     DirectoryRow,
+    DuRunner,
+    ElevatedScanPrompt,
     EntryKind,
+    FilesystemDetector,
     InvalidInitialPathError,
     ResultCache,
     ScanJob,
@@ -290,6 +296,30 @@ class NavigationTests(unittest.TestCase):
                 all(entry.kind is EntryKind.DIRECTORY for entry in listing.entries)
             )
 
+    def test_filesystem_detection_uses_the_deepest_mount_and_decodes_paths(
+        self,
+    ) -> None:
+        mountinfo = r"""22 1 8:1 / / rw,relatime - ext4 /dev/root rw
+        23 22 0:45 / /mnt/archive rw,relatime - btrfs /dev/data rw
+        24 23 8:2 / /mnt/archive/snapshots rw - ext4 /dev/snapshot rw
+        25 22 8:3 / /mnt/space\040name rw - xfs /dev/space rw"""
+
+        self.assertEqual(
+            FilesystemDetector.filesystem_type(Path("/mnt/archive/photos"), mountinfo),
+            "btrfs",
+        )
+        self.assertEqual(
+            FilesystemDetector.filesystem_type(
+                Path("/mnt/archive/snapshots/daily"),
+                mountinfo,
+            ),
+            "ext4",
+        )
+        self.assertEqual(
+            FilesystemDetector.filesystem_type(Path("/mnt/space name"), mountinfo),
+            "xfs",
+        )
+
     def test_normalizes_directories_and_rejects_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -359,6 +389,13 @@ class FakeRunner:
 
 class AppTests(unittest.IsolatedAsyncioTestCase):
     """Exercise immediate UI loading with a fake compression runner."""
+
+    @staticmethod
+    def _write_executable(path: Path, content: str) -> None:
+        """Create a temporary executable for the integrated privilege flow."""
+
+        path.write_text(f"#!/bin/sh\n{content}", encoding="utf-8")
+        path.chmod(0o755)
 
     async def test_navigation_renders_directories_before_scan_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -469,6 +506,89 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(runner.closed)
 
+    async def test_elevated_scan_requires_consent_before_releasing_terminal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            app = CompsizerApp(Path(temporary_directory), runner=FakeRunner())
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                with patch.object(
+                    app, "suspend", return_value=nullcontext()
+                ) as suspend:
+                    authorization = asyncio.create_task(
+                        app._authorize_elevated_scans(["/bin/true"])
+                    )
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, ElevatedScanPrompt)
+                    await pilot.press("n")
+                    self.assertFalse(await authorization)
+                    suspend.assert_not_called()
+
+                    authorization = asyncio.create_task(
+                        app._authorize_elevated_scans(["/bin/true"])
+                    )
+                    await pilot.pause()
+                    await pilot.press("y")
+                    self.assertTrue(await authorization)
+                    suspend.assert_called_once()
+
+                    authorization = asyncio.create_task(
+                        app._authorize_elevated_scans(["/bin/true"])
+                    )
+                    await pilot.pause()
+                    authorization.cancel()
+                    await asyncio.gather(authorization, return_exceptions=True)
+                    await pilot.pause()
+                    self.assertNotIsInstance(app.screen, ElevatedScanPrompt)
+
+    async def test_declining_elevation_displays_du_size_estimates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "child"
+            child.mkdir()
+            compsize = root / "compsize"
+            sudo = root / "sudo"
+            du = root / "du"
+            self._write_executable(
+                compsize,
+                "printf '%s: Operation not permitted\\n' \"$4\" >&2\nexit 1\n",
+            )
+            self._write_executable(sudo, "exit 1\n")
+            self._write_executable(
+                du,
+                'case " $* " in\n'
+                '  *" --apparent-size "*) printf "1200\\tignored\\n" ;;\n'
+                '  *) printf "700\\tignored\\n" ;;\n'
+                "esac\n",
+            )
+            app = CompsizerApp(root)
+            self.assertIsInstance(app.runner, CompsizeRunner)
+            app.runner.executable = str(compsize)
+            app.runner.sudo_executable = str(sudo)
+            app.runner.fallback_runner = DuRunner(str(du))
+
+            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+                async with app.run_test(size=(100, 30)) as pilot:
+                    for _ in range(100):
+                        if isinstance(app.screen, ElevatedScanPrompt):
+                            break
+                        await pilot.pause(0.01)
+                    self.assertIsInstance(app.screen, ElevatedScanPrompt)
+                    await pilot.press("n")
+
+                    for _ in range(100):
+                        result = next(iter(app.model.records.values())).result
+                        if result.state is ScanState.COMPLETE and result.is_estimate:
+                            break
+                        await pilot.pause(0.01)
+
+                    self.assertEqual(result.disk_usage_bytes, 700)
+                    self.assertEqual(result.uncompressed_bytes, 1200)
+                    self.assertIn("declined", result.warning or "")
+                    row = next(iter(app._row_widgets.values()))
+                    self.assertIn("~700 B", row.render().plain)
+
 
 class ScanManagerTests(unittest.IsolatedAsyncioTestCase):
     """Test bounded asynchronous scan scheduling."""
@@ -494,7 +614,31 @@ class ScanManagerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
-    """Test subprocess availability failures without requiring Btrfs."""
+    """Test subprocess, fallback, and elevation behavior without Btrfs."""
+
+    @staticmethod
+    def _write_executable(path: Path, content: str) -> None:
+        """Create a temporary executable for subprocess tests."""
+
+        path.write_text(f"#!/bin/sh\n{content}", encoding="utf-8")
+        path.chmod(0o755)
+
+    def test_trusted_executable_lookup_rejects_external_paths_and_symlinks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            trusted = root / "trusted"
+            trusted.mkdir()
+            external = root / "external"
+            self._write_executable(external, "exit 0\n")
+            (trusted / "compsize").symlink_to(external)
+
+            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(trusted)):
+                self.assertIsNone(CompsizeRunner._trusted_executable_path("compsize"))
+                self.assertIsNone(
+                    CompsizeRunner._trusted_executable_path(os.fspath(external))
+                )
 
     async def test_missing_executable_becomes_row_error(self) -> None:
         runner = CompsizeRunner("compsize-command-that-does-not-exist")
@@ -504,3 +648,294 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result.state, ScanState.ERROR)
         self.assertIn("not found", result.error or "")
         await runner.close()
+
+    async def test_du_runner_returns_allocated_and_apparent_size_estimates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            du = root / "du"
+            self._write_executable(
+                du,
+                'case " $* " in\n'
+                '  *" --apparent-size "*) printf "1200\\tignored\\n" ;;\n'
+                '  *) printf "700\\tignored\\n" ;;\n'
+                "esac\n",
+            )
+            path = root / "directory with spaces"
+            runner = DuRunner(str(du))
+
+            result = await runner.scan(path)
+
+            self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertEqual(result.disk_usage_bytes, 700)
+            self.assertEqual(result.uncompressed_bytes, 1200)
+            self.assertTrue(result.is_estimate)
+            self.assertIsNone(result.ratio)
+            self.assertIsNone(result.ratio_fraction)
+            row = DirectoryRow(
+                DirectoryRecord(DirectoryEntry(path, path.name), result, 0),
+                1200,
+            )
+            self.assertIn("~700 B", row.render().plain)
+            self.assertIn("1.2 KiB", row.render().plain)
+            await runner.close()
+
+    async def test_du_runner_keeps_partial_totals_with_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            du = root / "du"
+            self._write_executable(
+                du,
+                'case " $* " in\n'
+                '  *" --apparent-size "*) printf "1200\\tignored\\n" ;;\n'
+                '  *) printf "700\\tignored\\n"; '
+                "printf 'du: permission denied\\n' >&2; exit 1 ;;\n"
+                "esac\n",
+            )
+            runner = DuRunner(str(du))
+
+            result = await runner.scan(root / "partial")
+
+            self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertEqual(result.disk_usage_bytes, 700)
+            self.assertEqual(result.uncompressed_bytes, 1200)
+            self.assertIn("permission denied", result.warning or "")
+            await runner.close()
+
+    async def test_missing_du_returns_a_row_error(self) -> None:
+        runner = DuRunner("du-command-that-does-not-exist")
+
+        result = await runner.scan(Path("/tmp/example"))
+
+        self.assertIs(result.state, ScanState.ERROR)
+        self.assertIn("not found", result.error or "")
+        await runner.close()
+
+    async def test_permission_failure_uses_passwordless_sudo_after_consent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            compsize = root / "compsize"
+            sudo = root / "sudo"
+            self._write_executable(
+                compsize,
+                'if [ "${COMPSIZER_TEST_ELEVATED:-}" != 1 ]; then\n'
+                "  printf '%s: SEARCH_V2: Operation not permitted\\n' \"$4\" >&2\n"
+                "  exit 1\n"
+                "fi\n"
+                "printf 'TOTAL 50%% 50 100 100\\n'\n",
+            )
+            self._write_executable(
+                sudo,
+                '[ "$1" = -n ] || exit 88\n'
+                "shift\n"
+                '[ "$1" = -- ] || exit 88\n'
+                "shift\n"
+                'COMPSIZER_TEST_ELEVATED=1 exec "$@"\n',
+            )
+            authorization_calls = 0
+
+            async def authorize(_command: list[str]) -> bool:
+                nonlocal authorization_calls
+                authorization_calls += 1
+                return True
+
+            runner = CompsizeRunner(
+                str(compsize),
+                sudo_executable=str(sudo),
+                authorization_callback=authorize,
+            )
+
+            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+                result = await runner.scan(root / "first")
+
+            self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertEqual(authorization_calls, 1)
+            await runner.close()
+
+    async def test_permission_failure_prompts_once_for_concurrent_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            compsize = root / "compsize"
+            sudo = root / "sudo"
+            marker = root / "authorized"
+            self._write_executable(
+                compsize,
+                'if [ "${COMPSIZER_TEST_ELEVATED:-}" != 1 ]; then\n'
+                "  printf '%s: SEARCH_V2: Operation not permitted\\n' \"$4\" >&2\n"
+                "  exit 1\n"
+                "fi\n"
+                "printf 'TOTAL 50%% 50 100 100\\n'\n",
+            )
+            self._write_executable(
+                sudo,
+                f'[ "$1" = -n ] || exit 88\n'
+                "shift\n"
+                '[ "$1" = -- ] || exit 88\n'
+                "shift\n"
+                f"[ -f {shlex.quote(os.fspath(marker))} ] || "
+                "{ printf 'sudo: a password is required\\n' >&2; exit 1; }\n"
+                'COMPSIZER_TEST_ELEVATED=1 exec "$@"\n',
+            )
+            authorization_calls = 0
+
+            async def authorize(command: list[str]) -> bool:
+                nonlocal authorization_calls
+                authorization_calls += 1
+                self.assertEqual(command[-1], "--help")
+                await asyncio.sleep(0.01)
+                marker.touch()
+                return True
+
+            runner = CompsizeRunner(
+                str(compsize),
+                sudo_executable=str(sudo),
+                authorization_callback=authorize,
+            )
+
+            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+                results = await asyncio.gather(
+                    runner.scan(root / "first"),
+                    runner.scan(root / "second"),
+                )
+
+            self.assertEqual(
+                [result.state for result in results],
+                [ScanState.COMPLETE, ScanState.COMPLETE],
+            )
+            self.assertEqual(authorization_calls, 1)
+            await runner.close()
+
+    async def test_permission_warning_makes_partial_report_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            compsize = root / "compsize"
+            sudo = root / "sudo"
+            self._write_executable(
+                compsize,
+                'if [ "${COMPSIZER_TEST_ELEVATED:-}" != 1 ]; then\n'
+                "  printf 'TOTAL 50%% 50 100 100\\n'\n"
+                "  printf '%s: Permission denied\\n' \"$4\" >&2\n"
+                "  exit 0\n"
+                "fi\n"
+                "printf 'TOTAL 25%% 25 100 100\\n'\n",
+            )
+            self._write_executable(
+                sudo,
+                '[ "$1" = -n ] || exit 88\n'
+                "shift\n"
+                '[ "$1" = -- ] || exit 88\n'
+                "shift\n"
+                'COMPSIZER_TEST_ELEVATED=1 exec "$@"\n',
+            )
+            authorization_calls = 0
+
+            async def authorize(_command: list[str]) -> bool:
+                nonlocal authorization_calls
+                authorization_calls += 1
+                return True
+
+            runner = CompsizeRunner(
+                str(compsize),
+                sudo_executable=str(sudo),
+                authorization_callback=authorize,
+            )
+
+            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+                result = await runner.scan(root / "partial")
+
+            self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertEqual(result.disk_usage_bytes, 25)
+            self.assertEqual(authorization_calls, 1)
+            await runner.close()
+
+    async def test_non_btrfs_failure_does_not_request_elevation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            compsize = root / "compsize"
+            self._write_executable(
+                compsize,
+                "printf '%s: Not btrfs (or SEARCH_V2 unsupported).\\n' \"$4\" >&2\n"
+                "exit 1\n",
+            )
+            authorization_calls = 0
+
+            async def authorize(_command: list[str]) -> bool:
+                nonlocal authorization_calls
+                authorization_calls += 1
+                return True
+
+            runner = CompsizeRunner(
+                str(compsize),
+                authorization_callback=authorize,
+            )
+
+            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+                result = await runner.scan(root / "not-btrfs")
+
+            self.assertIs(result.state, ScanState.ERROR)
+            self.assertIn("Not btrfs", result.error or "")
+            self.assertEqual(authorization_calls, 0)
+            await runner.close()
+
+    async def test_declining_elevation_uses_du_without_repeated_prompts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            compsize = root / "compsize"
+            sudo = root / "sudo"
+            du = root / "du"
+            compsize_calls = root / "compsize-calls"
+            self._write_executable(
+                compsize,
+                f"printf x >> {shlex.quote(os.fspath(compsize_calls))}\n"
+                "printf '%s: SEARCH_V2: Operation not permitted\\n' \"$4\" >&2\n"
+                "exit 1\n",
+            )
+            self._write_executable(
+                sudo,
+                "printf 'sudo: a password is required\\n' >&2\nexit 1\n",
+            )
+            self._write_executable(
+                du,
+                'case " $* " in\n'
+                '  *" --apparent-size "*) printf "1200\\tignored\\n" ;;\n'
+                '  *) printf "700\\tignored\\n" ;;\n'
+                "esac\n",
+            )
+            authorization_calls = 0
+
+            async def decline(_command: list[str]) -> bool:
+                nonlocal authorization_calls
+                authorization_calls += 1
+                return False
+
+            runner = CompsizeRunner(
+                str(compsize),
+                sudo_executable=str(sudo),
+                authorization_callback=decline,
+                fallback_runner=DuRunner(str(du)),
+            )
+
+            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+                first = await runner.scan(root / "first")
+                second = await runner.scan(root / "second")
+
+            self.assertIs(first.state, ScanState.COMPLETE)
+            self.assertIs(second.state, ScanState.COMPLETE)
+            self.assertEqual(first.disk_usage_bytes, 700)
+            self.assertEqual(first.uncompressed_bytes, 1200)
+            self.assertIn("declined", first.warning or "")
+            self.assertIn("du estimates", second.warning or "")
+            self.assertEqual(authorization_calls, 1)
+            self.assertEqual(compsize_calls.read_text(encoding="utf-8"), "x")
+
+            runner.reset_privilege_decision()
+            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+                await runner.scan(root / "third")
+            self.assertEqual(authorization_calls, 2)
+            self.assertEqual(compsize_calls.read_text(encoding="utf-8"), "xx")
+            await runner.close()
