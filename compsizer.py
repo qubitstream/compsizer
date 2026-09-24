@@ -964,6 +964,20 @@ class WindowsScanRunner:
     def _scan(self, path: Path, cancellation: threading.Event) -> ScanResult:
         """Detect one volume and return its NTFS scan or unsupported status."""
 
+        if cancellation.is_set():
+            return ScanResult.error_result(path, "The scan was canceled.")
+
+        try:
+            root_metadata = self.file_api.inspect_path(path)
+        except OSError as exc:
+            return ScanResult.error_result(path, f"Could not inspect {path}: {exc}")
+        if not root_metadata.is_directory:
+            return ScanResult.error_result(
+                path, f"Scan target is not a directory: {path}"
+            )
+        if cancellation.is_set():
+            return ScanResult.error_result(path, "The scan was canceled.")
+
         try:
             filesystem_type = self.file_api.filesystem_type(path)
         except OSError as exc:
@@ -978,21 +992,7 @@ class WindowsScanRunner:
                 f"Size measurements are unavailable on {filesystem_label}.",
             )
         if cancellation.is_set():
-            return ScanResult.error_result(path, "The NTFS scan was canceled.")
-
-        try:
-            root_metadata = self.file_api.inspect_path(path)
-        except OSError as exc:
-            return ScanResult.error_result(
-                path,
-                f"Could not inspect scan root {path}: {exc}",
-            )
-        if not root_metadata.is_directory:
-            return ScanResult.error_result(
-                path, f"Scan target is not a directory: {path}"
-            )
-        if cancellation.is_set():
-            return ScanResult.error_result(path, "The NTFS scan was canceled.")
+            return ScanResult.error_result(path, "The scan was canceled.")
 
         return self._scan_ntfs(path, cancellation)
 

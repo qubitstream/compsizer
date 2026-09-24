@@ -1041,15 +1041,19 @@ class FakeWindowsFileApi:
         self.metadata_by_name = metadata_by_name
         self.inaccessible_names = inaccessible_names or set()
         self.inspected_names: list[str] = []
+        self.filesystem_paths: list[Path] = []
 
     def filesystem_type(self, path: Path) -> str:
         """Return the configured filesystem name."""
 
+        self.filesystem_paths.append(path)
         return self.filesystem
 
     def inspect_path(self, path: Path) -> WindowsFileMetadata:
         """Return configured metadata or emulate an access denial."""
 
+        if not path.exists():
+            raise FileNotFoundError(f"Path not found: {path}")
         if path.name not in self.metadata_by_name and path.is_dir():
             return WindowsFileMetadata(
                 file_identity=None,
@@ -1256,6 +1260,22 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             record = DirectoryRecord(DirectoryEntry(child, child.name), result, 0)
             row = DirectoryRow(record, BarScales.from_records([record]))
             self.assertIn("—", row.render().plain)
+            await runner.close()
+
+    async def test_deleted_non_ntfs_directory_returns_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "deleted-child"
+            child.mkdir()
+            child.rmdir()
+            api = FakeWindowsFileApi("exFAT", {})
+            runner = WindowsScanRunner(api)
+
+            result = await runner.scan(child)
+
+            self.assertIs(result.state, ScanState.ERROR)
+            self.assertIn("Could not inspect", result.error or "")
+            self.assertEqual(api.filesystem_paths, [])
             await runner.close()
 
     async def test_opened_volume_mount_root_is_scanned_on_its_own_volume(self) -> None:
