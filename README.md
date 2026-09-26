@@ -76,7 +76,8 @@ checkout to start with `./compsizer.py`.
 - `s`: cycle between size, compression-ratio, savings, and name sorting
 - `c`: toggle the in-memory result cache
 - `r`: refresh the current directory and rescan its children
-- `i`: show details for the selected row, including its full warning or error
+- `i`: show filesystem, scan method, byte sizes, available file counts,
+  compression details, and diagnostics
 - `?`: show help
 - `q`: quit
 
@@ -94,17 +95,27 @@ includes every row in name order.
 - With `compsize`, the visible size is the uncompressed extent size. It is not
   the apparent size reported by the `Referenced` column. After sudo is
   declined, the visible size is `du`'s apparent size.
+- The Flags column shows `C` when a scan finds a compressed extent on Btrfs or
+  a compressed file on NTFS, `S` when an NTFS scan finds sparse files, and
+  `?` when compression status is unknown. If neither `C` nor `?` appears, a
+  complete scan found no compressed data.
+- The `i` details view shows disk-usage and uncompressed bytes by Btrfs
+  compression type when `compsize` reports them. It shows file counts when the scanner
+  provides them. NTFS counts unique file identities, so hard links count once;
+  `du` does not report a file count.
 - On NTFS, the size column shows logical file bytes and the `Stored/Logical`
-  column compares allocated bytes with logical bytes. `C` marks a tree with
-  NTFS-compressed files; `S` marks a tree with sparse files. The selected-row
-  status and row tooltip show the counts. Sparse allocation affects the ratio,
-  so it is not a compression-only measurement.
+  column compares allocated bytes with logical bytes. NTFS counts appear in the
+  selected-row status and tooltip. Sparse allocation affects the ratio, so it
+  is not a compression-only measurement.
 - NTFS scans read file metadata only and count a hard-linked file once per
   scanned tree. Automatic scans skip directory reparse points, including a row
   whose root is a junction or mount point. The rows remain browsable; after
   entering one, child directories are scanned according to their volume.
   Inaccessible paths produce a partial result or an error. Windows does not
   need an elevated process.
+- A filesystem label appears after a directory name when its filesystem differs
+  from the current location or does not support the platform's exact metrics.
+  `[link]` marks a directory reparse point that the scanner skipped.
 - Non-NTFS Windows filesystems can be browsed without size statistics.
 - The bar uses a solid glyph for allocated space and a separate glyph for the
   difference to the size baseline. Btrfs, NTFS, and estimate results use

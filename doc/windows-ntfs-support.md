@@ -39,13 +39,17 @@ can be on a different mounted volume.
   child directories using the volume that contains each child.
 - On other Windows filesystems, allow directory browsing without size
   measurements. Do not display NTFS compression statistics for them.
+- Show the filesystem, scan method, and unique file count in row details. Label
+  a row in the list only when its filesystem differs from the current location
+  or lacks exact metrics. Mark a skipped directory reparse point as a link.
 - Do not change file compression state. Do not require an elevated Windows
   process. Report paths that the current user cannot read.
 
 The NTFS UI should distinguish logical size from stored size. It may show a
 compression ratio or savings when the selected size values support that
-calculation. It should identify compressed files as NTFS-compressed, without
-claiming an algorithm breakdown that the scanner does not provide.
+calculation. The Flags column marks a tree when the scan finds NTFS-compressed
+files or sparse files. It should not claim an algorithm breakdown that the
+scanner does not provide.
 
 ## Measurement requirements
 

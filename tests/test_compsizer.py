@@ -12,12 +12,15 @@ from textual.widgets import ListView, Static, Tree
 
 from compsizer import (
     DIRECTORY_PAGE_SIZE,
+    FLAGS_COLUMN_WIDTH,
     NAME_COLUMN_WIDTH,
     RATIO_COLUMN_WIDTH,
     SIZE_COLUMN_WIDTH,
     TREE_CHILD_LIMIT,
     BarScales,
     BrowserModel,
+    CompressionStatus,
+    CompressionTypeStats,
     CompsizeParseError,
     CompsizerApp,
     CompsizeRunner,
@@ -35,6 +38,7 @@ from compsizer import (
     ScanDetailsScreen,
     ScanJob,
     ScanManager,
+    ScanMethod,
     ScanRequest,
     ScanResult,
     ScanState,
@@ -60,7 +64,7 @@ class ParserTests(unittest.TestCase):
         Type       Perc   Disk Usage   Uncompressed   Referenced
         TOTAL      41%    400          1000           1200
         none       100%   100           100            100
-        zstd       20%    300          900            1100
+        zstd       0%     0            0              0
         zstd       20%    300          900            1100
         """
 
@@ -70,6 +74,16 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(report.uncompressed_bytes, 1000)
         self.assertEqual(report.referenced_bytes, 1200)
         self.assertEqual(report.compression_types, ("none", "zstd"))
+        self.assertEqual(
+            report.compression_type_stats,
+            (
+                CompressionTypeStats("none", 100, 100),
+                CompressionTypeStats("zstd", 300, 900),
+            ),
+        )
+        self.assertEqual(report.files_scanned, 3)
+        self.assertIs(report.compression_status, CompressionStatus.PRESENT)
+        self.assertIs(report.status_for_scan(complete=False), CompressionStatus.PRESENT)
         result = ScanResult(
             Path("/tmp/example"),
             ScanState.COMPLETE,
@@ -90,19 +104,48 @@ class ParserTests(unittest.TestCase):
 
         self.assertEqual(report.compression_types, ("none", "zstd"))
         self.assertEqual(report.disk_usage_bytes, 400)
+        self.assertIs(report.compression_status, CompressionStatus.PRESENT)
+        self.assertEqual(report.files_scanned, 2)
+
+    def test_compression_status_distinguishes_absent_unknown_and_partial(self) -> None:
+        uncompressed = parse_compsize_output(
+            "none 100% 100 100 100\nTOTAL 100% 100 100 100\n"
+        )
+        unknown_type = parse_compsize_output(
+            "future-codec 50% 50 100 100\nTOTAL 50% 50 100 100\n"
+        )
+        incomplete = parse_compsize_output(
+            "none 100% 100 100 100\nTOTAL 100% 100 100 100\n",
+            "warning: some extents were skipped\n",
+        )
+
+        self.assertIs(uncompressed.compression_status, CompressionStatus.ABSENT)
+        self.assertIs(unknown_type.compression_status, CompressionStatus.UNKNOWN)
+        self.assertIs(incomplete.compression_status, CompressionStatus.UNKNOWN)
+        self.assertIs(
+            incomplete.status_for_scan(complete=False), CompressionStatus.UNKNOWN
+        )
+        self.assertIs(
+            uncompressed.status_for_scan(complete=False), CompressionStatus.UNKNOWN
+        )
+        self.assertIs(
+            uncompressed.status_for_scan(complete=True), CompressionStatus.ABSENT
+        )
 
     def test_uses_only_the_last_processed_report(self) -> None:
         report = parse_compsize_output(
             "Processed 1 files.\n"
-            "none       100%   10           10             10\n"
+            "zstd       20%    5            10             10\n"
             "TOTAL      100%   10           10             10\n"
             "Processed 2 files, 3 extents.\n"
-            "zstd       20%    300          900            1100\n"
-            "TOTAL      41%    400          1000           1200\n"
+            "none       100%   10           10             10\n"
+            "TOTAL      100%   10           10             10\n"
         )
 
-        self.assertEqual(report.compression_types, ("zstd",))
-        self.assertEqual(report.disk_usage_bytes, 400)
+        self.assertEqual(report.compression_types, ("none",))
+        self.assertEqual(report.disk_usage_bytes, 10)
+        self.assertIs(report.compression_status, CompressionStatus.ABSENT)
+        self.assertEqual(report.files_scanned, 2)
 
     def test_uses_stderr_as_a_warning(self) -> None:
         report = parse_compsize_output(
@@ -133,6 +176,8 @@ class ParserTests(unittest.TestCase):
             self.assertTrue(report.empty)
             self.assertEqual(report.disk_usage_bytes, 0)
             self.assertEqual(report.uncompressed_bytes, 0)
+            self.assertIs(report.compression_status, CompressionStatus.ABSENT)
+            self.assertEqual(report.files_scanned, 0)
 
     def test_ignores_unexpected_spacing(self) -> None:
         report = parse_compsize_output("\tTOTAL\t99%\t10\t20\t30\n")
@@ -405,6 +450,34 @@ class RenderingTests(unittest.TestCase):
 
         self.assertEqual(bar.plain, " " * 8)
 
+    def test_flags_distinguish_compressed_uncompressed_and_unknown(self) -> None:
+        expected_flags = (
+            (CompressionStatus.PRESENT, False, None, "C"),
+            (CompressionStatus.ABSENT, False, None, ""),
+            (CompressionStatus.UNKNOWN, False, None, "?"),
+            (CompressionStatus.ABSENT, True, 1, "S"),
+            (CompressionStatus.UNKNOWN, True, 1, "?S"),
+        )
+
+        for status, is_ntfs, sparse_files, expected in expected_flags:
+            with self.subTest(status=status, is_ntfs=is_ntfs):
+                result = ScanResult(
+                    Path("/root/tree"),
+                    ScanState.COMPLETE,
+                    10,
+                    20,
+                    20,
+                    is_ntfs=is_ntfs,
+                    ntfs_sparse_files=sparse_files,
+                    compression_status=status,
+                )
+                record = DirectoryRecord(DirectoryEntry(result.path, "tree"), result, 0)
+                row = DirectoryRow(record, BarScales.from_records([record]))
+
+                self.assertEqual(
+                    row.render().plain[-FLAGS_COLUMN_WIDTH:].strip(), expected
+                )
+
     def test_column_header_tracks_flexible_graph_width(self) -> None:
         header = DirectoryColumnHeader("Stored/Logical", "Logical Size")
 
@@ -413,7 +486,11 @@ class RenderingTests(unittest.TestCase):
                 header_text = header.text_for_width(width).plain
                 effective_width = max(
                     width,
-                    NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + 5,
+                    NAME_COLUMN_WIDTH
+                    + RATIO_COLUMN_WIDTH
+                    + SIZE_COLUMN_WIDTH
+                    + FLAGS_COLUMN_WIDTH
+                    + 6,
                 )
                 graph_width = max(
                     1,
@@ -421,16 +498,19 @@ class RenderingTests(unittest.TestCase):
                     - NAME_COLUMN_WIDTH
                     - RATIO_COLUMN_WIDTH
                     - SIZE_COLUMN_WIDTH
-                    - 4,
+                    - FLAGS_COLUMN_WIDTH
+                    - 5,
                 )
                 ratio_start = NAME_COLUMN_WIDTH + graph_width + 2
                 size_start = ratio_start + RATIO_COLUMN_WIDTH + 1
+                flags_start = size_start + SIZE_COLUMN_WIDTH + 1
 
                 self.assertEqual(header_text.index("Stored/Logical"), ratio_start)
                 self.assertEqual(
                     header_text.index("Logical Size") + len("Logical Size"),
                     size_start + SIZE_COLUMN_WIDTH,
                 )
+                self.assertEqual(header_text.index("Flags"), flags_start)
 
 
 class NavigationTests(unittest.TestCase):
@@ -502,6 +582,13 @@ class NavigationTests(unittest.TestCase):
             FilesystemDetector.filesystem_type(Path("/mnt/space name"), mountinfo),
             "xfs",
         )
+        with patch.object(FilesystemDetector, "read_mountinfo", return_value=mountinfo):
+            self.assertEqual(
+                FilesystemDetector.filesystem_type_for_path(
+                    Path("/mnt/archive/photos")
+                ),
+                "btrfs",
+            )
 
     def test_normalizes_directories_and_rejects_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -724,6 +811,183 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("escape")
                 self.assertNotIsInstance(app.screen, ScanDetailsScreen)
 
+    async def test_details_show_filesystem_and_scan_method(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "child"
+            child.mkdir()
+            (child / "payload.bin").write_bytes(b"payload")
+            api = FakeWindowsFileApi(
+                "NTFS",
+                {
+                    "payload.bin": WindowsFileMetadata(
+                        file_identity=(1, b"payload-id"),
+                        logical_size=4096,
+                        allocated_size=2048,
+                        is_directory=False,
+                        is_reparse_point=False,
+                        is_compressed=False,
+                        is_sparse=False,
+                    )
+                },
+            )
+            app = CompsizerApp(root, runner=WindowsScanRunner(api))
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                for _ in range(100):
+                    rows = tuple(app._row_widgets.values())
+                    if (
+                        rows
+                        and rows[0].record.result.state is ScanState.COMPLETE
+                        and rows[0].record.result.filesystem_type == "NTFS"
+                    ):
+                        break
+                    await pilot.pause(0.01)
+
+                await pilot.press("home")
+                await pilot.press("i")
+                await pilot.pause()
+
+                details_text = app.screen.query_one(
+                    "#scan-details-text", Static
+                ).render()
+                self.assertIn("Filesystem: NTFS", str(details_text))
+                self.assertIn("Scan method: NTFS metadata", str(details_text))
+                self.assertIn("Compression: not found", str(details_text))
+                self.assertIn("Unique files measured: 1", str(details_text))
+                self.assertIn("Allocated size: 2.0 KiB (2048 bytes)", str(details_text))
+                self.assertIn("Logical size: 4.0 KiB (4096 bytes)", str(details_text))
+
+    async def test_details_show_btrfs_type_sizes_and_file_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "child").mkdir()
+
+            class BtrfsDetailsRunner:
+                """Return one report with per-type size and file data."""
+
+                async def scan(self, path: Path) -> ScanResult:
+                    return ScanResult(
+                        path=path,
+                        state=ScanState.COMPLETE,
+                        disk_usage_bytes=400,
+                        uncompressed_bytes=1000,
+                        referenced_bytes=1200,
+                        filesystem_type="btrfs",
+                        scan_method=ScanMethod.COMPSIZE,
+                        compression_status=CompressionStatus.PRESENT,
+                        compression_type_stats=(
+                            CompressionTypeStats("none", 100, 100),
+                            CompressionTypeStats("zstd", 300, 900),
+                        ),
+                        files_scanned=3,
+                    )
+
+                async def close(self) -> None:
+                    return None
+
+            app = CompsizerApp(root, runner=BtrfsDetailsRunner())
+
+            async with app.run_test(size=(110, 30)) as pilot:
+                for _ in range(100):
+                    rows = tuple(app._row_widgets.values())
+                    if rows and rows[0].record.result.state is ScanState.COMPLETE:
+                        break
+                    await pilot.pause(0.01)
+
+                await pilot.press("home")
+                await pilot.press("i")
+                await pilot.pause()
+
+                details_text = app.screen.query_one(
+                    "#scan-details-text", Static
+                ).render()
+                self.assertIn("Files processed: 3", str(details_text))
+                self.assertIn("Btrfs size by compression type:", str(details_text))
+                self.assertIn(
+                    "none: Disk usage 100 B (100 bytes); uncompressed "
+                    "100 B (100 bytes)",
+                    str(details_text),
+                )
+                self.assertIn(
+                    "zstd: Disk usage 300 B (300 bytes); uncompressed "
+                    "900 B (900 bytes)",
+                    str(details_text),
+                )
+
+    async def test_filesystem_badges_mark_different_and_unsupported_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "ntfs-volume").mkdir()
+            (root / "exfat-volume").mkdir()
+            (root / "link-volume").mkdir()
+
+            class MixedFilesystemApi(FakeWindowsFileApi):
+                def filesystem_type(self, path: Path) -> str:
+                    self.filesystem_paths.append(path)
+                    return "NTFS" if path.name == "ntfs-volume" else "exFAT"
+
+            api = MixedFilesystemApi(
+                "exFAT",
+                {
+                    "link-volume": WindowsFileMetadata(
+                        file_identity=None,
+                        logical_size=0,
+                        allocated_size=0,
+                        is_directory=True,
+                        is_reparse_point=True,
+                        is_compressed=False,
+                        is_sparse=False,
+                    )
+                },
+            )
+            runner = WindowsScanRunner(api)
+            app = CompsizerApp(root, runner=runner)
+
+            async with app.run_test(size=(120, 30)) as pilot:
+                expected_badges = {
+                    "ntfs-volume": "[NTFS]",
+                    "exfat-volume": "[exFAT]",
+                    "link-volume": "[link]",
+                }
+                for _ in range(100):
+                    rows = tuple(app._row_widgets.values())
+                    if (
+                        len(rows) == 3
+                        and all(
+                            row.record.result.state
+                            in {ScanState.COMPLETE, ScanState.UNAVAILABLE}
+                            for row in rows
+                        )
+                        and app._current_filesystem_type == "exFAT"
+                        and all(
+                            expected_badges[row.record.entry.name] in row.render().plain
+                            for row in rows
+                        )
+                    ):
+                        break
+                    await pilot.pause(0.01)
+
+                row_text = {row.record.entry.name: row.render().plain for row in rows}
+                self.assertEqual(
+                    set(row_text), {"ntfs-volume", "exfat-volume", "link-volume"}
+                )
+                self.assertIn("[NTFS]", row_text["ntfs-volume"])
+                self.assertIn("[exFAT]", row_text["exfat-volume"])
+                self.assertIn("[link]", row_text["link-volume"])
+                link_record = next(
+                    row.record for row in rows if row.record.entry.name == "link-volume"
+                )
+                self.assertTrue(link_record.result.is_reparse_point)
+                await pilot.press("end")
+                await pilot.press("i")
+                await pilot.pause()
+                details_text = app.screen.query_one(
+                    "#scan-details-text", Static
+                ).render()
+                self.assertIn("Scan details: link-volume", str(details_text))
+                self.assertIn("Filesystem: not resolved", str(details_text))
+
     async def test_column_header_fields_align_with_visible_row(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -752,6 +1016,10 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     header_text.rindex("Size") + len("Size"),
                     row_text.rindex("100 B") + len("100 B"),
                 )
+                self.assertEqual(
+                    header_text.index("Flags"), len(row_text) - FLAGS_COLUMN_WIDTH
+                )
+                self.assertEqual(row_text[-FLAGS_COLUMN_WIDTH:].strip(), "?")
 
     async def test_help_paragraphs_do_not_contain_forced_line_breaks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1317,30 +1585,89 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.uncompressed_bytes, 11700)
             self.assertEqual(result.disk_usage_bytes, 5068)
             self.assertTrue(result.is_ntfs)
+            self.assertEqual(result.filesystem_type, "NTFS")
+            self.assertIs(result.scan_method, ScanMethod.NTFS_METADATA)
             self.assertEqual(result.ntfs_compressed_files, 1)
             self.assertEqual(result.ntfs_sparse_files, 1)
+            self.assertEqual(result.files_scanned, 4)
+            self.assertIs(result.compression_status, CompressionStatus.PRESENT)
             self.assertAlmostEqual(result.ratio or 0.0, 5068 / 11700)
             self.assertIn("Skipped 1 reparse point", result.warning or "")
             self.assertNotIn("must-not-scan.bin", api.inspected_names)
 
             record = DirectoryRecord(DirectoryEntry(root, root.name), result, 0)
             row = DirectoryRow(record, BarScales.from_records([record]))
-            self.assertIn("C", row.render().plain)
-            self.assertIn("S", row.render().plain)
+            self.assertEqual(row.render().plain[-FLAGS_COLUMN_WIDTH:].strip(), "CS")
             self.assertIn("NTFS-compressed files: 1", str(row.tooltip))
 
             header = DirectoryColumnHeader("Stored/Logical", "Logical Size")
             header_text = header.text_for_width(120).plain
             graph_width = (
-                120 - NAME_COLUMN_WIDTH - RATIO_COLUMN_WIDTH - SIZE_COLUMN_WIDTH - 4
+                120
+                - NAME_COLUMN_WIDTH
+                - RATIO_COLUMN_WIDTH
+                - SIZE_COLUMN_WIDTH
+                - FLAGS_COLUMN_WIDTH
+                - 5
             )
             ratio_start = NAME_COLUMN_WIDTH + 1 + graph_width + 1
             size_start = ratio_start + RATIO_COLUMN_WIDTH + 1
+            flags_start = size_start + SIZE_COLUMN_WIDTH + 1
             self.assertEqual(header_text.index("Stored/Logical"), ratio_start)
             self.assertEqual(
                 header_text.index("Logical Size") + len("Logical Size"),
                 size_start + SIZE_COLUMN_WIDTH,
             )
+            self.assertEqual(header_text.index("Flags"), flags_start)
+            await runner.close()
+
+    async def test_ntfs_empty_tree_is_known_to_have_no_compressed_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            runner = WindowsScanRunner(FakeWindowsFileApi("NTFS", {}))
+
+            result = await runner.scan(root)
+
+            self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertIs(result.compression_status, CompressionStatus.ABSENT)
+            self.assertEqual(result.files_scanned, 0)
+            await runner.close()
+
+    async def test_skipped_reparse_subtree_keeps_compression_status_unknown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            junction = root / "junction"
+            junction.mkdir()
+            hidden_file = junction / "hidden-compressed.bin"
+            hidden_file.write_bytes(b"not traversed")
+            api = FakeWindowsFileApi(
+                "NTFS",
+                {
+                    "junction": self._metadata(
+                        None,
+                        directory=True,
+                        reparse=True,
+                    ),
+                    "hidden-compressed.bin": self._metadata(
+                        (5, b"hidden-file"),
+                        100,
+                        50,
+                        compressed=True,
+                    ),
+                },
+            )
+            runner = WindowsScanRunner(api)
+
+            result = await runner.scan(root)
+
+            self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertIs(result.compression_status, CompressionStatus.UNKNOWN)
+            self.assertNotIn("hidden-compressed.bin", api.inspected_names)
+            record = DirectoryRecord(DirectoryEntry(root, root.name), result, 0)
+            row = DirectoryRow(record, BarScales.from_records([record]))
+            self.assertEqual(row.render().plain[-FLAGS_COLUMN_WIDTH:].strip(), "?")
             await runner.close()
 
     async def test_non_ntfs_volume_is_browsable_without_scan_metrics(self) -> None:
@@ -1356,6 +1683,9 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(result.state, ScanState.UNAVAILABLE)
             self.assertIsNone(result.disk_usage_bytes)
             self.assertIn("exFAT", result.warning or "")
+            self.assertEqual(result.filesystem_type, "exFAT")
+            self.assertIsNone(result.scan_method)
+            self.assertIs(result.compression_status, CompressionStatus.UNKNOWN)
             self.assertEqual(api.inspected_names, [])
 
             model = BrowserModel(root, ResultCache())
@@ -1371,6 +1701,7 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             record = DirectoryRecord(DirectoryEntry(child, child.name), result, 0)
             row = DirectoryRow(record, BarScales.from_records([record]))
             self.assertIn("—", row.render().plain)
+            self.assertEqual(row.render().plain[-FLAGS_COLUMN_WIDTH:].strip(), "?")
             await runner.close()
 
     async def test_deleted_non_ntfs_directory_returns_an_error(self) -> None:
@@ -1414,6 +1745,9 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIs(result.state, ScanState.UNAVAILABLE)
             self.assertIn("reparse point", result.warning or "")
+            self.assertTrue(result.is_reparse_point)
+            self.assertIsNone(result.filesystem_type)
+            self.assertIs(result.compression_status, CompressionStatus.UNKNOWN)
             self.assertEqual(api.inspected_names, ["mounted-volume"])
             self.assertEqual(api.filesystem_paths, [])
 
@@ -1425,6 +1759,9 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(child_result.state, ScanState.COMPLETE)
             self.assertEqual(child_result.uncompressed_bytes, 12)
             self.assertEqual(child_result.disk_usage_bytes, 8)
+            self.assertEqual(child_result.filesystem_type, "NTFS")
+            self.assertIs(child_result.scan_method, ScanMethod.NTFS_METADATA)
+            self.assertEqual(child_result.files_scanned, 1)
             self.assertEqual(api.filesystem_paths, [child])
             await runner.close()
 
@@ -1450,6 +1787,8 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.has_statistics)
             self.assertEqual(result.disk_usage_bytes, 64)
             self.assertEqual(result.uncompressed_bytes, 80)
+            self.assertIs(result.compression_status, CompressionStatus.UNKNOWN)
+            self.assertEqual(result.files_scanned, 1)
             self.assertIn("denied.bin", result.error or "")
             self.assertCountEqual(api.inspected_names, ["readable.bin", "denied.bin"])
             await runner.close()
@@ -1471,6 +1810,7 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(result.ntfs_compressed_files)
             self.assertIsNone(result.ntfs_sparse_files)
             self.assertIsNone(result.ntfs_summary)
+            self.assertIs(result.compression_status, CompressionStatus.UNKNOWN)
             await runner.close()
 
     async def test_cancelled_thread_keeps_its_scan_slot_until_it_stops(self) -> None:
@@ -1644,6 +1984,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result.state, ScanState.ERROR)
         self.assertIn("not found", result.error or "")
+        self.assertIs(result.scan_method, ScanMethod.COMPSIZE)
         await runner.close()
 
     async def test_du_runner_returns_allocated_and_apparent_size_estimates(
@@ -1668,6 +2009,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.disk_usage_bytes, 700)
             self.assertEqual(result.uncompressed_bytes, 1200)
             self.assertTrue(result.is_estimate)
+            self.assertIs(result.scan_method, ScanMethod.DU)
             self.assertIsNone(result.ratio)
             self.assertIsNone(result.ratio_fraction)
             record = DirectoryRecord(DirectoryEntry(path, path.name), result, 0)
@@ -1705,6 +2047,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result.state, ScanState.ERROR)
         self.assertIn("not found", result.error or "")
+        self.assertIs(result.scan_method, ScanMethod.DU)
         await runner.close()
 
     async def test_permission_failure_uses_passwordless_sudo_after_consent(
@@ -1720,7 +2063,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 "  printf '%s: SEARCH_V2: Operation not permitted\\n' \"$4\" >&2\n"
                 "  exit 1\n"
                 "fi\n"
-                "printf 'TOTAL 50%% 50 100 100\\n'\n",
+                "printf 'Processed 4 files.\\nzstd 50%% 50 100 100\\n"
+                "TOTAL 50%% 50 100 100\\n'\n",
             )
             self._write_executable(
                 sudo,
@@ -1743,10 +2087,29 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 authorization_callback=authorize,
             )
 
-            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+            with (
+                patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)),
+                patch(
+                    "compsizer.FilesystemDetector.filesystem_type_for_path",
+                    return_value="btrfs",
+                ),
+            ):
                 result = await runner.scan(root / "first")
 
             self.assertIs(result.state, ScanState.COMPLETE)
+            self.assertEqual(result.filesystem_type, "btrfs")
+            self.assertIs(result.scan_method, ScanMethod.COMPSIZE)
+            self.assertIs(result.compression_status, CompressionStatus.PRESENT)
+            self.assertEqual(result.files_scanned, 4)
+            self.assertEqual(
+                result.compression_type_stats,
+                (CompressionTypeStats("zstd", 50, 100),),
+            )
+            record = DirectoryRecord(
+                DirectoryEntry(result.path, result.path.name), result, 0
+            )
+            row = DirectoryRow(record, BarScales.from_records([record]))
+            self.assertEqual(row.render().plain[-FLAGS_COLUMN_WIDTH:].strip(), "C")
             self.assertEqual(authorization_calls, 1)
             await runner.close()
 
@@ -1915,7 +2278,13 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                 fallback_runner=DuRunner(str(du)),
             )
 
-            with patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)):
+            with (
+                patch("compsizer.SYSTEM_EXECUTABLE_PATH", os.fspath(root)),
+                patch(
+                    "compsizer.FilesystemDetector.filesystem_type_for_path",
+                    return_value="btrfs",
+                ),
+            ):
                 first = await runner.scan(root / "first")
                 second = await runner.scan(root / "second")
 
@@ -1923,6 +2292,8 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(second.state, ScanState.COMPLETE)
             self.assertEqual(first.disk_usage_bytes, 700)
             self.assertEqual(first.uncompressed_bytes, 1200)
+            self.assertEqual(first.filesystem_type, "btrfs")
+            self.assertIs(first.scan_method, ScanMethod.DU)
             self.assertIn("declined", first.warning or "")
             self.assertIn("du estimates", second.warning or "")
             self.assertEqual(authorization_calls, 1)

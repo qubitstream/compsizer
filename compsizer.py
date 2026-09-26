@@ -65,6 +65,9 @@ BAR_STYLE = "green"
 NAME_COLUMN_WIDTH = 26
 RATIO_COLUMN_WIDTH = 14
 SIZE_COLUMN_WIDTH = 13
+FLAGS_COLUMN_WIDTH = 5
+BTRFS_COMPRESSED_TYPES = frozenset(("zlib", "lzo", "zstd"))
+BTRFS_UNCOMPRESSED_TYPES = frozenset(("none", "prealloc"))
 
 FILE_ATTRIBUTE_DIRECTORY = 0x0010
 FILE_ATTRIBUTE_SPARSE_FILE = 0x0200
@@ -94,6 +97,22 @@ class ScanState(Enum):
     COMPLETE = "complete"
     ERROR = "error"
     UNAVAILABLE = "unavailable"
+
+
+class ScanMethod(Enum):
+    """Backends that can provide size measurements."""
+
+    COMPSIZE = "compsize"
+    DU = "du"
+    NTFS_METADATA = "NTFS metadata"
+
+
+class CompressionStatus(Enum):
+    """Describe whether a scan found compressed data."""
+
+    PRESENT = "found"
+    ABSENT = "not found"
+    UNKNOWN = "unknown"
 
 
 class SortMode(Enum):
@@ -138,27 +157,52 @@ class DirectoryListing:
 
 
 @dataclass(frozen=True, slots=True)
+class CompressionTypeStats:
+    """Represent disk-usage and uncompressed bytes for one Btrfs data type."""
+
+    type_name: str
+    disk_usage_bytes: int
+    uncompressed_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedCompsizeReport:
-    """Represent byte values extracted from a successful report."""
+    """Represent byte totals, type rows, and findings from a report."""
 
     disk_usage_bytes: int
     uncompressed_bytes: int
     referenced_bytes: int
-    compression_types: tuple[str, ...] = ()
+    compression_type_stats: tuple[CompressionTypeStats, ...] = ()
     warning: str | None = None
     empty: bool = False
+    compression_status: CompressionStatus = CompressionStatus.UNKNOWN
+    files_scanned: int | None = None
+
+    @property
+    def compression_types(self) -> tuple[str, ...]:
+        """Return the distinct type labels in this report."""
+
+        return tuple(stats.type_name for stats in self.compression_type_stats)
+
+    def status_for_scan(self, *, complete: bool) -> CompressionStatus:
+        """Avoid reporting no compression when a scan did not finish."""
+
+        if self.compression_status is CompressionStatus.PRESENT:
+            return CompressionStatus.PRESENT
+        if not complete:
+            return CompressionStatus.UNKNOWN
+        return self.compression_status
 
 
 @dataclass(frozen=True, slots=True)
 class ScanResult:
-    """Represent measured or estimated size statistics for one path."""
+    """Represent one path's statistics, scan source, and diagnostics."""
 
     path: Path
     state: ScanState
     disk_usage_bytes: int | None = None
     uncompressed_bytes: int | None = None
     referenced_bytes: int | None = None
-    compression_types: tuple[str, ...] = ()
     warning: str | None = None
     error: str | None = None
     exit_code: int | None = None
@@ -166,6 +210,12 @@ class ScanResult:
     is_ntfs: bool = False
     ntfs_compressed_files: int | None = None
     ntfs_sparse_files: int | None = None
+    filesystem_type: str | None = None
+    scan_method: ScanMethod | None = None
+    is_reparse_point: bool = False
+    compression_status: CompressionStatus = CompressionStatus.UNKNOWN
+    compression_type_stats: tuple[CompressionTypeStats, ...] = ()
+    files_scanned: int | None = None
 
     @property
     def ratio(self) -> float | None:
@@ -230,6 +280,12 @@ class ScanResult:
             f"sparse files: {self.ntfs_sparse_files}."
         )
 
+    @property
+    def compression_types(self) -> tuple[str, ...]:
+        """Return the distinct compression type labels reported by the scan."""
+
+        return tuple(stats.type_name for stats in self.compression_type_stats)
+
     @classmethod
     def pending(cls, path: Path) -> ScanResult:
         """Create a pending result for ``path``."""
@@ -249,6 +305,7 @@ class ScanResult:
         message: str,
         *,
         exit_code: int | None = None,
+        scan_method: ScanMethod | None = None,
     ) -> ScanResult:
         """Create an error result without hiding the failing path."""
 
@@ -257,6 +314,7 @@ class ScanResult:
             state=ScanState.ERROR,
             error=message,
             exit_code=exit_code,
+            scan_method=scan_method,
         )
 
     @classmethod
@@ -354,6 +412,15 @@ class FilesystemDetector:
             )
         except OSError:
             return None
+
+    @staticmethod
+    def filesystem_type_for_path(path: Path) -> str | None:
+        """Return the mounted filesystem type for a path, when available."""
+
+        mountinfo = FilesystemDetector.read_mountinfo()
+        if mountinfo is None:
+            return None
+        return FilesystemDetector.filesystem_type(path, mountinfo)
 
     @staticmethod
     def filesystem_type(path: Path, mountinfo: str) -> str | None:
@@ -731,10 +798,16 @@ def parse_compsize_output(stdout: str, stderr: str = "") -> ParsedCompsizeReport
             referenced_bytes=0,
             warning=None,
             empty=True,
+            compression_status=CompressionStatus.ABSENT,
+            files_scanned=0,
         )
 
     total: tuple[int, int, int] | None = None
-    compression_types: list[str] = []
+    type_totals: dict[str, list[int]] = {}
+    files_scanned: int | None = None
+    has_compressed_data = False
+    has_unknown_type_data = False
+    has_data_type_row = False
     for line in stdout.splitlines():
         tokens = line.split()
         if not tokens:
@@ -745,7 +818,18 @@ def parse_compsize_output(stdout: str, stderr: str = "") -> ParsedCompsizeReport
             and tokens[2].casefold().startswith("file")
         ):
             total = None
-            compression_types = []
+            type_totals = {}
+            try:
+                reported_file_count = int(tokens[1])
+            except ValueError:
+                files_scanned = None
+            else:
+                files_scanned = (
+                    reported_file_count if reported_file_count >= 0 else None
+                )
+            has_compressed_data = False
+            has_unknown_type_data = False
+            has_data_type_row = False
             continue
         if tokens[0].upper() == "TOTAL":
             total = _parse_byte_columns(tokens, line)
@@ -753,29 +837,64 @@ def parse_compsize_output(stdout: str, stderr: str = "") -> ParsedCompsizeReport
         if len(tokens) < 5 or not tokens[1].endswith("%"):
             continue
         try:
-            _parse_byte_columns(tokens, line)
+            type_sizes = _parse_byte_columns(tokens, line)
         except CompsizeParseError:
             continue
         type_name = tokens[0]
-        if type_name not in compression_types:
-            compression_types.append(type_name)
+        totals = type_totals.setdefault(type_name, [0, 0, 0])
+        for index, size in enumerate(type_sizes):
+            totals[index] += size
+        if any(type_sizes):
+            has_data_type_row = True
+            normalized_type = type_name.casefold()
+            if normalized_type in BTRFS_COMPRESSED_TYPES:
+                has_compressed_data = True
+            elif normalized_type not in BTRFS_UNCOMPRESSED_TYPES:
+                has_unknown_type_data = True
 
     if total is None:
         processed_zero = any(
             _is_empty_report_message(line) for line in stdout.splitlines()
         )
         if processed_zero and not stderr.strip():
-            return ParsedCompsizeReport(0, 0, 0, empty=True)
+            return ParsedCompsizeReport(
+                0,
+                0,
+                0,
+                empty=True,
+                compression_status=CompressionStatus.ABSENT,
+                files_scanned=0,
+            )
         detail = diagnostic_text(stderr) or "No TOTAL row was found."
         raise CompsizeParseError(f"Could not parse compsize output: {detail}")
 
     warning = diagnostic_text(stderr) or None
+    if has_compressed_data:
+        compression_status = CompressionStatus.PRESENT
+    elif (
+        warning is not None
+        or has_unknown_type_data
+        or (any(total) and not has_data_type_row)
+    ):
+        compression_status = CompressionStatus.UNKNOWN
+    else:
+        compression_status = CompressionStatus.ABSENT
+    compression_type_stats = tuple(
+        CompressionTypeStats(
+            type_name=type_name,
+            disk_usage_bytes=type_sizes[0],
+            uncompressed_bytes=type_sizes[1],
+        )
+        for type_name, type_sizes in type_totals.items()
+    )
     return ParsedCompsizeReport(
         disk_usage_bytes=total[0],
         uncompressed_bytes=total[1],
         referenced_bytes=total[2],
-        compression_types=tuple(compression_types),
+        compression_type_stats=compression_type_stats,
         warning=warning,
+        compression_status=compression_status,
+        files_scanned=files_scanned,
     )
 
 
@@ -822,7 +941,11 @@ class DuRunner:
 
         if allocated.size_bytes is None and apparent.size_bytes is None:
             detail = "; ".join(messages) or "du did not return a size."
-            return ScanResult.error_result(path, detail)
+            return ScanResult.error_result(
+                path,
+                detail,
+                scan_method=ScanMethod.DU,
+            )
 
         return ScanResult(
             path=path,
@@ -831,6 +954,7 @@ class DuRunner:
             uncompressed_bytes=apparent.size_bytes,
             warning=" ".join(messages) or None,
             is_estimate=True,
+            scan_method=ScanMethod.DU,
         )
 
     async def _measure(self, path: Path, *, apparent: bool) -> _DuMeasurement:
@@ -978,9 +1102,14 @@ class WindowsScanRunner:
         if cancellation.is_set():
             return ScanResult.error_result(path, "The scan was canceled.")
         if root_metadata.is_reparse_point:
-            return ScanResult.unavailable_result(
-                path,
-                "Skipped this directory reparse point. Open it to browse its target.",
+            return ScanResult(
+                path=path,
+                state=ScanState.UNAVAILABLE,
+                warning=(
+                    "Skipped this directory reparse point. "
+                    "Open it to browse its target."
+                ),
+                is_reparse_point=True,
             )
 
         try:
@@ -992,14 +1121,24 @@ class WindowsScanRunner:
             )
         if filesystem_type.casefold() != "ntfs":
             filesystem_label = filesystem_type or "an unknown filesystem"
-            return ScanResult.unavailable_result(
-                path,
-                f"Size measurements are unavailable on {filesystem_label}.",
+            return ScanResult(
+                path=path,
+                state=ScanState.UNAVAILABLE,
+                warning=f"Size measurements are unavailable on {filesystem_label}.",
+                filesystem_type=filesystem_type,
             )
         if cancellation.is_set():
-            return ScanResult.error_result(path, "The scan was canceled.")
+            return replace(
+                ScanResult.error_result(path, "The scan was canceled."),
+                filesystem_type=filesystem_type,
+                scan_method=ScanMethod.NTFS_METADATA,
+            )
 
-        return self._scan_ntfs(path, cancellation)
+        return replace(
+            self._scan_ntfs(path, cancellation),
+            filesystem_type=filesystem_type,
+            scan_method=ScanMethod.NTFS_METADATA,
+        )
 
     def _scan_ntfs(
         self,
@@ -1085,6 +1224,12 @@ class WindowsScanRunner:
                 error = diagnostic_text(f"{error} {'; '.join(diagnostics)}")
 
         statistics_available = failed_paths == 0 or measured_files > 0
+        if compressed_files:
+            compression_status = CompressionStatus.PRESENT
+        elif failed_paths or skipped_reparse_points:
+            compression_status = CompressionStatus.UNKNOWN
+        else:
+            compression_status = CompressionStatus.ABSENT
         return ScanResult(
             path=path,
             state=ScanState.ERROR if failed_paths else ScanState.COMPLETE,
@@ -1095,6 +1240,8 @@ class WindowsScanRunner:
             is_ntfs=True,
             ntfs_compressed_files=compressed_files if statistics_available else None,
             ntfs_sparse_files=sparse_files if statistics_available else None,
+            compression_status=compression_status,
+            files_scanned=measured_files,
         )
 
     @staticmethod
@@ -1147,6 +1294,16 @@ class CompsizeRunner:
         self._authorization_lock: asyncio.Lock = asyncio.Lock()
 
     async def scan(self, path: Path) -> ScanResult:
+        """Scan one path and attach its filesystem and measurement backend."""
+
+        filesystem_type = await asyncio.to_thread(
+            FilesystemDetector.filesystem_type_for_path,
+            path,
+        )
+        result = await self._scan_with_privilege_policy(path)
+        return replace(result, filesystem_type=filesystem_type)
+
+    async def _scan_with_privilege_policy(self, path: Path) -> ScanResult:
         """Scan ``path``, offering one sudo prompt after a permission failure."""
 
         if self._running_as_root:
@@ -1301,7 +1458,13 @@ class CompsizeRunner:
                     f"Unable to run {self.executable!r}: executable not found "
                     "in trusted system directories."
                 )
-                return _CompsizeAttempt(ScanResult.error_result(path, message))
+                return _CompsizeAttempt(
+                    ScanResult.error_result(
+                        path,
+                        message,
+                        scan_method=ScanMethod.COMPSIZE,
+                    )
+                )
             command = [executable_path, "-b", "-x", "--", os.fspath(path)]
         if elevated:
             sudo_path = self._trusted_executable_path(self.sudo_executable)
@@ -1316,7 +1479,13 @@ class CompsizeRunner:
                     "Unable to start elevated scans; these trusted executables were "
                     f"not found: {', '.join(missing)}."
                 )
-                return _CompsizeAttempt(ScanResult.error_result(path, message))
+                return _CompsizeAttempt(
+                    ScanResult.error_result(
+                        path,
+                        message,
+                        scan_method=ScanMethod.COMPSIZE,
+                    )
+                )
             command = [
                 sudo_path,
                 "-n",
@@ -1343,7 +1512,13 @@ class CompsizeRunner:
                 f"Unable to start {executable_name} executable {command[0]!r}: "
                 "file not found."
             )
-            return _CompsizeAttempt(ScanResult.error_result(path, message))
+            return _CompsizeAttempt(
+                ScanResult.error_result(
+                    path,
+                    message,
+                    scan_method=ScanMethod.COMPSIZE,
+                )
+            )
         except OSError as exc:
             executable_name = "sudo" if elevated else "compsize"
             return _CompsizeAttempt(
@@ -1351,6 +1526,7 @@ class CompsizeRunner:
                     path,
                     f"Unable to start {executable_name} executable "
                     f"{command[0]!r}: {exc}",
+                    scan_method=ScanMethod.COMPSIZE,
                 )
             )
 
@@ -1375,6 +1551,7 @@ class CompsizeRunner:
                     path,
                     diagnostic_text(stderr) or "Sudo could not run compsize.",
                     exit_code=exit_code,
+                    scan_method=ScanMethod.COMPSIZE,
                 ),
                 sudo_authentication_failed=True,
             )
@@ -1388,7 +1565,12 @@ class CompsizeRunner:
             if detail and detail not in message:
                 message = f"{message} ({detail})"
             return _CompsizeAttempt(
-                ScanResult.error_result(path, message, exit_code=exit_code),
+                ScanResult.error_result(
+                    path,
+                    message,
+                    exit_code=exit_code,
+                    scan_method=ScanMethod.COMPSIZE,
+                ),
                 permission_required=permission_required,
             )
 
@@ -1402,6 +1584,11 @@ class CompsizeRunner:
                     referenced_bytes=0,
                     warning=report.warning,
                     exit_code=exit_code,
+                    scan_method=ScanMethod.COMPSIZE,
+                    files_scanned=report.files_scanned,
+                    compression_status=report.status_for_scan(
+                        complete=not permission_required and exit_code in (None, 0)
+                    ),
                 ),
                 permission_required=permission_required,
             )
@@ -1413,10 +1600,13 @@ class CompsizeRunner:
                     disk_usage_bytes=report.disk_usage_bytes,
                     uncompressed_bytes=report.uncompressed_bytes,
                     referenced_bytes=report.referenced_bytes,
-                    compression_types=report.compression_types,
+                    compression_type_stats=report.compression_type_stats,
                     warning=report.warning,
                     error=diagnostic_text(stderr),
                     exit_code=exit_code,
+                    scan_method=ScanMethod.COMPSIZE,
+                    files_scanned=report.files_scanned,
+                    compression_status=report.status_for_scan(complete=False),
                 ),
                 permission_required=True,
             )
@@ -1431,10 +1621,13 @@ class CompsizeRunner:
                     disk_usage_bytes=report.disk_usage_bytes,
                     uncompressed_bytes=report.uncompressed_bytes,
                     referenced_bytes=report.referenced_bytes,
-                    compression_types=report.compression_types,
+                    compression_type_stats=report.compression_type_stats,
                     warning=report.warning,
                     error=error,
                     exit_code=exit_code,
+                    scan_method=ScanMethod.COMPSIZE,
+                    files_scanned=report.files_scanned,
+                    compression_status=report.status_for_scan(complete=False),
                 )
             )
         return _CompsizeAttempt(
@@ -1444,9 +1637,12 @@ class CompsizeRunner:
                 disk_usage_bytes=report.disk_usage_bytes,
                 uncompressed_bytes=report.uncompressed_bytes,
                 referenced_bytes=report.referenced_bytes,
-                compression_types=report.compression_types,
+                compression_type_stats=report.compression_type_stats,
                 warning=report.warning,
                 exit_code=exit_code,
+                scan_method=ScanMethod.COMPSIZE,
+                files_scanned=report.files_scanned,
+                compression_status=report.status_for_scan(complete=True),
             )
         )
 
@@ -2083,8 +2279,11 @@ def render_bar(
 def _directory_graph_width(width: int) -> int:
     """Return the flexible graph width used by directory rows and headers."""
 
-    minimum_width = NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + 5
-    fixed_width = NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + 4
+    column_widths = (
+        NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + FLAGS_COLUMN_WIDTH
+    )
+    minimum_width = column_widths + 6
+    fixed_width = column_widths + 5
     return max(1, max(width, minimum_width) - fixed_width)
 
 
@@ -2110,6 +2309,8 @@ class DirectoryColumnHeader(Static):
         header.append(pad_left(self.ratio_label, RATIO_COLUMN_WIDTH))
         header.append(" ")
         header.append(pad_left(self.size_label, SIZE_COLUMN_WIDTH))
+        header.append(" ")
+        header.append(pad_right("Flags", FLAGS_COLUMN_WIDTH))
         return header
 
     def render(self) -> Text:
@@ -2126,10 +2327,16 @@ class DirectoryColumnHeader(Static):
 class DirectoryRow(Static):
     """Render one directory record with responsive columns."""
 
-    def __init__(self, record: DirectoryRecord, bar_scales: BarScales) -> None:
+    def __init__(
+        self,
+        record: DirectoryRecord,
+        bar_scales: BarScales,
+        filesystem_badge: str | None = None,
+    ) -> None:
         super().__init__(markup=False, classes="directory-row")
-        self.record = record
-        self.bar_scales = bar_scales
+        self.record: DirectoryRecord = record
+        self.bar_scales: BarScales = bar_scales
+        self.filesystem_badge: str | None = filesystem_badge
         self.tooltip = self._tooltip_text(record.result)
 
     @staticmethod
@@ -2143,11 +2350,17 @@ class DirectoryRow(Static):
             details.append(result.ntfs_summary)
         return " ".join(item for item in details if item) or None
 
-    def update_record(self, record: DirectoryRecord, bar_scales: BarScales) -> None:
+    def update_record(
+        self,
+        record: DirectoryRecord,
+        bar_scales: BarScales,
+        filesystem_badge: str | None = None,
+    ) -> None:
         """Replace row data and refresh its display."""
 
         self.record = record
         self.bar_scales = bar_scales
+        self.filesystem_badge = filesystem_badge
         self.tooltip = self._tooltip_text(record.result)
         self.refresh()
 
@@ -2157,11 +2370,14 @@ class DirectoryRow(Static):
         self.refresh()
 
     def render(self) -> Text:
-        """Build a row using fixed numeric columns and a flexible graph."""
+        """Build a row using fixed data columns and a flexible graph."""
 
         graph_width = _directory_graph_width(self.size.width)
         result = self.record.result
-        name = truncate_middle(self.record.entry.name, NAME_COLUMN_WIDTH)
+        name = self.record.entry.name
+        if self.filesystem_badge:
+            name = f"{name} [{self.filesystem_badge}]"
+        name = truncate_middle(name, NAME_COLUMN_WIDTH)
         ratio_or_used = (
             format_bytes(result.disk_usage_bytes)
             if result.is_estimate
@@ -2172,17 +2388,7 @@ class DirectoryRow(Static):
         size = format_bytes(result.uncompressed_bytes)
         if result.is_estimate and result.uncompressed_bytes is not None:
             size = f"~{size}"
-        if result.is_ntfs:
-            markers = "".join(
-                marker
-                for marker, count in (
-                    ("C", result.ntfs_compressed_files),
-                    ("S", result.ntfs_sparse_files),
-                )
-                if count is not None and count > 0
-            )
-            if markers:
-                ratio_or_used = f"{ratio_or_used} {markers}"
+        flags = self._flags_text(result)
         if result.state is ScanState.ERROR and not result.has_statistics:
             ratio_or_used = "error"
             size = "error"
@@ -2202,6 +2408,8 @@ class DirectoryRow(Static):
         line.append(" ")
         size_start = len(line.plain)
         line.append(pad_left(size, SIZE_COLUMN_WIDTH))
+        line.append(" ")
+        line.append(pad_right(flags, FLAGS_COLUMN_WIDTH))
         if result.state is ScanState.ERROR:
             line.stylize("red", ratio_start, len(line.plain))
         elif result.state in {ScanState.RUNNING, ScanState.UNAVAILABLE}:
@@ -2209,6 +2417,19 @@ class DirectoryRow(Static):
         elif result.warning:
             line.stylize("yellow", ratio_start, size_start)
         return line
+
+    @staticmethod
+    def _flags_text(result: ScanResult) -> str:
+        """Show observed compression and sparse data, or unknown compression."""
+
+        flags: list[str] = []
+        if result.compression_status is CompressionStatus.PRESENT:
+            flags.append("C")
+        elif result.compression_status is CompressionStatus.UNKNOWN:
+            flags.append("?")
+        if result.is_ntfs and (result.ntfs_sparse_files or 0) > 0:
+            flags.append("S")
+        return "".join(flags)
 
 
 class DirectoryListView(ListView):
@@ -2277,11 +2498,14 @@ class HelpScreen(ModalScreen[None]):
             "Bars show allocated usage (█) and the difference to the size "
             "baseline (░). On Btrfs, the size column shows uncompressed "
             "extent bytes. On NTFS, it shows logical size; Stored/Logical "
-            "compares allocated bytes with logical bytes. C marks "
-            "NTFS-compressed files, and S marks sparse files. The selected-row "
-            "status and tooltip show their counts. Sparse allocation can affect "
+            "compares allocated bytes with logical bytes. Flags use C for "
+            "found compressed data, S for found NTFS sparse files, and ? when "
+            "compression status is unknown. If neither C nor ? appears, a "
+            "complete scan found no compressed data. NTFS counts appear in the "
+            "selected-row status and tooltip. Sparse allocation can affect "
             "Stored/Logical, so that value is not a compression-only ratio. "
-            "NTFS directory-link rows are not measured, but remain navigable.\n\n"
+            "A filesystem label marks a different or unsupported filesystem; "
+            "[link] marks an unmeasured directory reparse point.\n\n"
             "When elevated Btrfs scans are unavailable, du provides "
             "apparent-size and allocated-space estimates. A ~ marks estimated "
             "values in both numeric columns. Bars use separate scales for each "
@@ -2329,8 +2553,14 @@ class ScanDetailsScreen(ModalScreen[None]):
         super().__init__()
         self.record: DirectoryRecord = record
 
+    @staticmethod
+    def _size_with_bytes(value: int) -> str:
+        """Show a readable size and its exact, copyable byte count."""
+
+        return f"{format_bytes(value)} ({value} bytes)"
+
     def compose(self) -> ComposeResult:
-        """Compose the selected row's paths, sizes, warnings, and errors."""
+        """Compose filesystem, compression, size, and diagnostic details."""
 
         result = self.record.result
         details = [
@@ -2338,6 +2568,30 @@ class ScanDetailsScreen(ModalScreen[None]):
             f"Path: {self.record.entry.path}",
             f"Status: {result.state.value}",
         ]
+        if result.is_reparse_point:
+            details.append("Filesystem: not resolved (directory reparse point)")
+            details.append("Scan method: skipped")
+        else:
+            details.append(f"Filesystem: {result.filesystem_type or 'unknown'}")
+            if result.scan_method is not None:
+                method = result.scan_method.value
+                if result.is_estimate:
+                    method = f"{method} estimate"
+                details.append(f"Scan method: {method}")
+            elif result.state is ScanState.PENDING:
+                details.append("Scan method: not started")
+            elif result.state is ScanState.RUNNING:
+                details.append("Scan method: running")
+            elif result.state is ScanState.UNAVAILABLE:
+                details.append("Scan method: unavailable")
+            else:
+                details.append("Scan method: unknown")
+        details.append(f"Compression: {result.compression_status.value}")
+        if result.files_scanned is not None:
+            file_count_label = (
+                "Unique files measured" if result.is_ntfs else "Files processed"
+            )
+            details.append(f"{file_count_label}: {result.files_scanned}")
         if result.disk_usage_bytes is not None:
             if result.is_ntfs:
                 disk_label = "Allocated size"
@@ -2345,7 +2599,9 @@ class ScanDetailsScreen(ModalScreen[None]):
                 disk_label = "Allocated estimate"
             else:
                 disk_label = "Disk usage"
-            details.append(f"{disk_label}: {format_bytes(result.disk_usage_bytes)}")
+            details.append(
+                f"{disk_label}: {self._size_with_bytes(result.disk_usage_bytes)}"
+            )
         if result.uncompressed_bytes is not None:
             if result.is_ntfs:
                 size_label = "Logical size"
@@ -2353,12 +2609,26 @@ class ScanDetailsScreen(ModalScreen[None]):
                 size_label = "Apparent size estimate"
             else:
                 size_label = "Uncompressed size"
-            details.append(f"{size_label}: {format_bytes(result.uncompressed_bytes)}")
+            details.append(
+                f"{size_label}: {self._size_with_bytes(result.uncompressed_bytes)}"
+            )
         if result.ratio is not None:
             ratio_label = "Stored/logical ratio" if result.is_ntfs else "Ratio"
             details.append(f"{ratio_label}: {format_ratio(result.ratio)}")
-        if result.compression_types:
-            details.append(f"Compression types: {', '.join(result.compression_types)}")
+        nonempty_type_stats = tuple(
+            stats
+            for stats in result.compression_type_stats
+            if stats.disk_usage_bytes or stats.uncompressed_bytes
+        )
+        if nonempty_type_stats:
+            details.append("Btrfs size by compression type:")
+            for stats in nonempty_type_stats:
+                details.append(
+                    f"  {stats.type_name}: "
+                    f"Disk usage {self._size_with_bytes(stats.disk_usage_bytes)}; "
+                    "uncompressed "
+                    f"{self._size_with_bytes(stats.uncompressed_bytes)}"
+                )
         if result.ntfs_summary:
             details.append(result.ntfs_summary)
         if result.error:
@@ -2545,6 +2815,13 @@ class CompsizerApp(App[None]):
             )
         )
         self.manager = ScanManager(self.runner, self._on_scan_update)
+        if isinstance(self.runner, WindowsScanRunner):
+            self._supported_filesystem_type: str | None = "NTFS"
+        elif isinstance(self.runner, CompsizeRunner):
+            self._supported_filesystem_type = "btrfs"
+        else:
+            self._supported_filesystem_type = None
+        self._current_filesystem_type: str | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._view_load_task: asyncio.Task[Any] | None = None
         self._tree_reveal_task: asyncio.Task[Any] | None = None
@@ -2679,6 +2956,7 @@ class CompsizerApp(App[None]):
         view_id = self.model.begin_view(path, refresh=refresh)
         self._page_index = 0
         self._bar_scales = BarScales(0, 0)
+        self._current_filesystem_type = None
         self._update_path_label()
         self._update_status("Enumerating directories…")
         self._view_load_task = self._track(self._load_view(view_id, path))
@@ -2712,6 +2990,33 @@ class CompsizerApp(App[None]):
         self._update_status()
         requests = self.model.requests_for_missing_results(self._visible_paths())
         await self.manager.set_view(view_id, requests)
+        if self._shutting_down or not self._ui_ready:
+            return
+        try:
+            filesystem_type = await asyncio.to_thread(
+                self._filesystem_type_for_path,
+                path,
+            )
+        except asyncio.CancelledError:
+            return
+        if self._shutting_down or view_id != self.model.view_id:
+            return
+        if filesystem_type != self._current_filesystem_type:
+            self._current_filesystem_type = filesystem_type
+            self._schedule_row_render()
+
+    def _filesystem_type_for_path(self, path: Path) -> str | None:
+        """Read the filesystem type for the active platform and scanner."""
+
+        if isinstance(self.runner, WindowsScanRunner):
+            try:
+                return self.runner.file_api.filesystem_type(path)
+            except OSError as exc:
+                LOGGER.debug("Could not identify the filesystem for %s: %s", path, exc)
+                return None
+        if isinstance(self.runner, CompsizeRunner):
+            return FilesystemDetector.filesystem_type_for_path(path)
+        return None
 
     async def _on_scan_update(self, job: ScanJob, result: ScanResult) -> None:
         """Apply a scan update and refresh only the affected current view."""
@@ -2822,14 +3127,15 @@ class CompsizerApp(App[None]):
             new_items: list[ListItem] = []
             for key, record in records_by_key.items():
                 row = self._row_widgets.get(key)
+                filesystem_badge = self._filesystem_badge(record)
                 if row is None:
-                    row = DirectoryRow(record, bar_scales)
+                    row = DirectoryRow(record, bar_scales, filesystem_badge)
                     self._row_widgets[key] = row
                     item = ListItem(row)
                     self._row_items[key] = item
                     new_items.append(item)
                 else:
-                    row.update_record(record, bar_scales)
+                    row.update_record(record, bar_scales, filesystem_badge)
 
             if new_items:
                 try:
@@ -2887,6 +3193,26 @@ class CompsizerApp(App[None]):
             else:
                 empty_label.update("No child directories.")
             self._update_status()
+
+    def _filesystem_badge(self, record: DirectoryRecord) -> str | None:
+        """Return a compact label for a link or a different filesystem."""
+
+        result = record.result
+        if result.is_reparse_point:
+            return "link"
+        filesystem_type = result.filesystem_type
+        if filesystem_type is None:
+            return None
+        filesystem_key = filesystem_type.casefold()
+        differs_from_current = (
+            self._current_filesystem_type is not None
+            and filesystem_key != self._current_filesystem_type.casefold()
+        )
+        is_unsupported = (
+            self._supported_filesystem_type is not None
+            and filesystem_key != self._supported_filesystem_type.casefold()
+        )
+        return filesystem_type if differs_from_current or is_unsupported else None
 
     def _schedule_row_render(self) -> None:
         """Coalesce rapid scan updates into one short UI refresh window."""
