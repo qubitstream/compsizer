@@ -8,16 +8,20 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from textual.widgets import ListView, Tree
+from textual.widgets import ListView, Static, Tree
 
 from compsizer import (
     DIRECTORY_PAGE_SIZE,
+    NAME_COLUMN_WIDTH,
+    RATIO_COLUMN_WIDTH,
+    SIZE_COLUMN_WIDTH,
     TREE_CHILD_LIMIT,
     BarScales,
     BrowserModel,
     CompsizeParseError,
     CompsizerApp,
     CompsizeRunner,
+    DirectoryColumnHeader,
     DirectoryEntry,
     DirectoryListing,
     DirectoryRecord,
@@ -28,6 +32,7 @@ from compsizer import (
     FilesystemDetector,
     InvalidInitialPathError,
     ResultCache,
+    ScanDetailsScreen,
     ScanJob,
     ScanManager,
     ScanRequest,
@@ -400,6 +405,33 @@ class RenderingTests(unittest.TestCase):
 
         self.assertEqual(bar.plain, " " * 8)
 
+    def test_column_header_tracks_flexible_graph_width(self) -> None:
+        header = DirectoryColumnHeader("Stored/Logical", "Logical Size")
+
+        for width in (58, 60, 82, 120):
+            with self.subTest(width=width):
+                header_text = header.text_for_width(width).plain
+                effective_width = max(
+                    width,
+                    NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + 5,
+                )
+                graph_width = max(
+                    1,
+                    effective_width
+                    - NAME_COLUMN_WIDTH
+                    - RATIO_COLUMN_WIDTH
+                    - SIZE_COLUMN_WIDTH
+                    - 4,
+                )
+                ratio_start = NAME_COLUMN_WIDTH + graph_width + 2
+                size_start = ratio_start + RATIO_COLUMN_WIDTH + 1
+
+                self.assertEqual(header_text.index("Stored/Logical"), ratio_start)
+                self.assertEqual(
+                    header_text.index("Logical Size") + len("Logical Size"),
+                    size_start + SIZE_COLUMN_WIDTH,
+                )
+
 
 class NavigationTests(unittest.TestCase):
     """Test path normalization and direct directory enumeration."""
@@ -663,6 +695,76 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(runner.calls, [child, child])
                 await pilot.pause(0.1)
                 self.assertEqual(runner.calls, [child, child])
+
+    async def test_i_opens_selected_scan_details_with_full_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "child"
+            child.mkdir()
+            app = CompsizerApp(root, runner=ErrorRunner())
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                for _ in range(100):
+                    records = tuple(app.model.records.values())
+                    if records and records[0].result.state is ScanState.ERROR:
+                        break
+                    await pilot.pause(0.01)
+
+                await pilot.press("home")
+                await pilot.press("i")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, ScanDetailsScreen)
+                details_screen = app.screen
+                details_text = details_screen.query_one(
+                    "#scan-details-text", Static
+                ).render()
+                self.assertIn("test scan failure", str(details_text))
+
+                await pilot.press("escape")
+                self.assertNotIsInstance(app.screen, ScanDetailsScreen)
+
+    async def test_column_header_fields_align_with_visible_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "child").mkdir()
+            app = CompsizerApp(root, runner=FakeRunner())
+
+            async with app.run_test(size=(120, 30)) as pilot:
+                for _ in range(100):
+                    rows = tuple(app._row_widgets.values())
+                    if rows and rows[0].record.result.state is ScanState.COMPLETE:
+                        break
+                    await pilot.pause(0.01)
+
+                header = app.query_one("#column-label", DirectoryColumnHeader)
+                row = next(iter(app._row_widgets.values()))
+                header_text = header.render().plain
+                row_text = row.render().plain
+
+                self.assertEqual(header.size.width, row.size.width)
+                self.assertEqual(header_text.index("Bar"), row_text.index("█"))
+                self.assertEqual(
+                    header_text.rindex("Ratio/Used") + len("Ratio/Used"),
+                    row_text.rindex("10.0%") + len("10.0%"),
+                )
+                self.assertEqual(
+                    header_text.rindex("Size") + len("Size"),
+                    row_text.rindex("100 B") + len("100 B"),
+                )
+
+    async def test_help_paragraphs_do_not_contain_forced_line_breaks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            app = CompsizerApp(Path(temporary_directory), runner=FakeRunner())
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.press("?")
+                await pilot.pause()
+
+                help_text = app.screen.query_one("#help-text", Static).render().plain
+                self.assertIn("size baseline (░). On Btrfs", help_text)
+                self.assertIn("uncompressed extent bytes. On NTFS", help_text)
+                self.assertIn("allocated bytes with logical bytes", help_text)
 
     async def test_status_diagnostics_fit_within_two_lines(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1227,9 +1329,18 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("S", row.render().plain)
             self.assertIn("NTFS-compressed files: 1", str(row.tooltip))
 
-            app = CompsizerApp(root, runner=runner)
-            self.assertIn("Stored/Logical", app._column_header())
-            self.assertIn("Logical Size", app._column_header())
+            header = DirectoryColumnHeader("Stored/Logical", "Logical Size")
+            header_text = header.text_for_width(120).plain
+            graph_width = (
+                120 - NAME_COLUMN_WIDTH - RATIO_COLUMN_WIDTH - SIZE_COLUMN_WIDTH - 4
+            )
+            ratio_start = NAME_COLUMN_WIDTH + 1 + graph_width + 1
+            size_start = ratio_start + RATIO_COLUMN_WIDTH + 1
+            self.assertEqual(header_text.index("Stored/Logical"), ratio_start)
+            self.assertEqual(
+                header_text.index("Logical Size") + len("Logical Size"),
+                size_start + SIZE_COLUMN_WIDTH,
+            )
             await runner.close()
 
     async def test_non_ntfs_volume_is_browsable_without_scan_metrics(self) -> None:
@@ -1278,12 +1389,14 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api.filesystem_paths, [])
             await runner.close()
 
-    async def test_opened_volume_mount_root_is_scanned_on_its_own_volume(self) -> None:
+    async def test_reparse_root_is_skipped_but_remains_browsable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             mount = root / "mounted-volume"
             mount.mkdir()
-            (mount / "payload.bin").write_bytes(b"outside tree")
+            child = mount / "child"
+            child.mkdir()
+            (child / "payload.bin").write_bytes(b"outside tree")
             api = FakeWindowsFileApi(
                 "NTFS",
                 {
@@ -1299,10 +1412,20 @@ class WindowsScanTests(unittest.IsolatedAsyncioTestCase):
 
             result = await runner.scan(mount)
 
-            self.assertIs(result.state, ScanState.COMPLETE)
-            self.assertEqual(result.uncompressed_bytes, 12)
-            self.assertEqual(result.disk_usage_bytes, 8)
-            self.assertEqual(api.inspected_names, ["mounted-volume", "payload.bin"])
+            self.assertIs(result.state, ScanState.UNAVAILABLE)
+            self.assertIn("reparse point", result.warning or "")
+            self.assertEqual(api.inspected_names, ["mounted-volume"])
+            self.assertEqual(api.filesystem_paths, [])
+
+            listing = enumerate_directories(mount)
+            self.assertEqual([entry.path for entry in listing.entries], [child])
+
+            child_result = await runner.scan(child)
+
+            self.assertIs(child_result.state, ScanState.COMPLETE)
+            self.assertEqual(child_result.uncompressed_bytes, 12)
+            self.assertEqual(child_result.disk_usage_bytes, 8)
+            self.assertEqual(api.filesystem_paths, [child])
             await runner.close()
 
     async def test_ntfs_permission_errors_keep_partial_totals_and_continue(

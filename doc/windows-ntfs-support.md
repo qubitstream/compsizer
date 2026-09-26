@@ -34,8 +34,9 @@ can be on a different mounted volume.
 - On Linux Btrfs, use the existing `compsize` backend.
 - On Windows NTFS, use read-only Windows APIs to collect file attributes,
   identities, and size data, then aggregate results for each directory row.
-- Keep directory mount points browsable, but do not cross them during a scan
-  of their parent. When a user opens one, scan it using its mounted volume.
+- Keep directory reparse points browsable, but do not scan them as row roots or
+  cross them during a scan of their parent. After a user opens one, scan its
+  child directories using the volume that contains each child.
 - On other Windows filesystems, allow directory browsing without size
   measurements. Do not display NTFS compression statistics for them.
 - Do not change file compression state. Do not require an elevated Windows
@@ -64,12 +65,12 @@ not used because its documented result is the compressed or sparse size for
 those files, but the logical file size for ordinary uncompressed files. Those
 values would not give consistent allocated-size totals.
 
-Count a hard-linked file once within each scanned tree. Do not recurse through
-directory reparse points or follow file reparse points found below the scan
-root. A directory mount point remains navigable as its own location; its parent
-scan does not cross it, and a scan started at the mount point uses its mounted
-volume. Separate directory scans can overlap if the same file is linked into
-more than one tree.
+Count a hard-linked file once within each scanned tree. Skip a directory
+reparse point when it is the root of an automatic row scan. Do not recurse
+through directory reparse points or follow file reparse points found below the
+scan root. Keep directory reparse points navigable; after the user opens one,
+scan its child directories using their own volumes. Separate directory scans
+can overlap if the same file is linked into more than one tree.
 
 No suitable read-only Windows command has been identified that provides the
 required combined per-file compression, sparse, identity, and allocated-size

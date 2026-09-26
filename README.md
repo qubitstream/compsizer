@@ -76,6 +76,7 @@ checkout to start with `./compsizer.py`.
 - `s`: cycle between size, compression-ratio, savings, and name sorting
 - `c`: toggle the in-memory result cache
 - `r`: refresh the current directory and rescan its children
+- `i`: show details for the selected row, including its full warning or error
 - `?`: show help
 - `q`: quit
 
@@ -99,10 +100,11 @@ includes every row in name order.
   status and row tooltip show the counts. Sparse allocation affects the ratio,
   so it is not a compression-only measurement.
 - NTFS scans read file metadata only and count a hard-linked file once per
-  scanned tree. Scans skip reparse points below their selected root, so parent
-  scans do not cross directory mount points. A mount point that the user opens
-  is scanned on its own volume. Inaccessible paths produce a partial result or
-  an error. Windows does not need an elevated process.
+  scanned tree. Automatic scans skip directory reparse points, including a row
+  whose root is a junction or mount point. The rows remain browsable; after
+  entering one, child directories are scanned according to their volume.
+  Inaccessible paths produce a partial result or an error. Windows does not
+  need an elevated process.
 - Non-NTFS Windows filesystems can be browsed without size statistics.
 - The bar uses a solid glyph for allocated space and a separate glyph for the
   difference to the size baseline. Btrfs, NTFS, and estimate results use

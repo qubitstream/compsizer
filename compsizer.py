@@ -977,6 +977,11 @@ class WindowsScanRunner:
             )
         if cancellation.is_set():
             return ScanResult.error_result(path, "The scan was canceled.")
+        if root_metadata.is_reparse_point:
+            return ScanResult.unavailable_result(
+                path,
+                "Skipped this directory reparse point. Open it to browse its target.",
+            )
 
         try:
             filesystem_type = self.file_api.filesystem_type(path)
@@ -2075,6 +2080,49 @@ def render_bar(
     return bar
 
 
+def _directory_graph_width(width: int) -> int:
+    """Return the flexible graph width used by directory rows and headers."""
+
+    minimum_width = NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + 5
+    fixed_width = NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + 4
+    return max(1, max(width, minimum_width) - fixed_width)
+
+
+class DirectoryColumnHeader(Static):
+    """Render column labels using the same flexible width as directory rows."""
+
+    def __init__(self, ratio_label: str, size_label: str) -> None:
+        super().__init__(markup=False, id="column-label")
+        self.ratio_label: str = ratio_label
+        self.size_label: str = size_label
+
+    def text_for_width(self, width: int) -> Text:
+        """Build labels aligned to a directory row of the given width."""
+
+        graph_width = _directory_graph_width(width)
+        bar_label = _take_cells("Bar", graph_width)
+
+        header = Text()
+        header.append(pad_right("Directory", NAME_COLUMN_WIDTH))
+        header.append(" ")
+        header.append(pad_right(bar_label, graph_width))
+        header.append(" ")
+        header.append(pad_left(self.ratio_label, RATIO_COLUMN_WIDTH))
+        header.append(" ")
+        header.append(pad_left(self.size_label, SIZE_COLUMN_WIDTH))
+        return header
+
+    def render(self) -> Text:
+        """Render labels using the header's current allocated width."""
+
+        return self.text_for_width(self.size.width)
+
+    def on_resize(self, _event: events.Resize) -> None:
+        """Refresh labels when the content pane changes width."""
+
+        self.refresh()
+
+
 class DirectoryRow(Static):
     """Render one directory record with responsive columns."""
 
@@ -2111,12 +2159,7 @@ class DirectoryRow(Static):
     def render(self) -> Text:
         """Build a row using fixed numeric columns and a flexible graph."""
 
-        width = max(
-            self.size.width,
-            NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + 5,
-        )
-        fixed_width = NAME_COLUMN_WIDTH + RATIO_COLUMN_WIDTH + SIZE_COLUMN_WIDTH + 4
-        graph_width = max(1, width - fixed_width)
+        graph_width = _directory_graph_width(self.size.width)
         result = self.record.result
         name = truncate_middle(self.record.entry.name, NAME_COLUMN_WIDTH)
         ratio_or_used = (
@@ -2217,39 +2260,121 @@ class HelpScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         """Compose the help dialog."""
 
-        text = """Compsizer controls
-
-Up/Down, j/k   Move selection
-Home/End        Select first/last row on page
-PageUp/Down     Change directory page
-Enter, l        Open selected directory
-Backspace, h    Open parent directory
-Tab             Change pane
-s               Cycle size / ratio / savings / name sorting
-c               Toggle result cache
-r               Refresh current directory and rescan
-?               Show this help
-q               Quit
-
-Bars show allocated usage (█) and the difference to the size
-baseline (░). On Btrfs, the size column shows uncompressed extent bytes.
-On NTFS, it shows logical size; Stored/Logical compares allocated bytes
-with logical bytes. C marks NTFS-compressed files, and S marks sparse
-files. The selected-row status and tooltip show their counts. Sparse
-allocation can affect Stored/Logical, so that value is not a compression-only
-ratio.
-
-When elevated Btrfs scans are unavailable, du provides apparent-size
-and allocated-space estimates. A ~ marks estimated values in both
-numeric columns. Bars use separate scales for each source. These
-estimates are not Btrfs extent statistics. Independent Btrfs directory
-scans are not additive because reflinks and shared extents may overlap.
-
-Esc             Close help"""
+        text = (
+            "Compsizer controls\n\n"
+            "Up/Down, j/k   Move selection\n"
+            "Home/End        Select first/last row on page\n"
+            "PageUp/Down     Change directory page\n"
+            "Enter, l        Open selected directory\n"
+            "Backspace, h    Open parent directory\n"
+            "Tab             Change pane\n"
+            "s               Cycle size / ratio / savings / name sorting\n"
+            "c               Toggle result cache\n"
+            "r               Refresh current directory and rescan\n"
+            "i               Show selected row details\n"
+            "?               Show this help\n"
+            "q               Quit\n\n"
+            "Bars show allocated usage (█) and the difference to the size "
+            "baseline (░). On Btrfs, the size column shows uncompressed "
+            "extent bytes. On NTFS, it shows logical size; Stored/Logical "
+            "compares allocated bytes with logical bytes. C marks "
+            "NTFS-compressed files, and S marks sparse files. The selected-row "
+            "status and tooltip show their counts. Sparse allocation can affect "
+            "Stored/Logical, so that value is not a compression-only ratio. "
+            "NTFS directory-link rows are not measured, but remain navigable.\n\n"
+            "When elevated Btrfs scans are unavailable, du provides "
+            "apparent-size and allocated-space estimates. A ~ marks estimated "
+            "values in both numeric columns. Bars use separate scales for each "
+            "source. These estimates are not Btrfs extent statistics. "
+            "Independent Btrfs directory scans are not additive because "
+            "reflinks and shared extents may overlap.\n\n"
+            "Esc             Close help"
+        )
         yield Container(Static(Text(text), id="help-text"), id="help-dialog")
 
     def action_close(self) -> None:
         """Close the help dialog."""
+
+        self.dismiss(None)
+
+
+class ScanDetailsScreen(ModalScreen[None]):
+    """Show the selected directory's scan result and full diagnostics."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "close", "Close", show=False),
+        Binding("i", "close", "Close", show=False),
+    ]
+
+    CSS = """
+    ScanDetailsScreen {
+        align: center middle;
+    }
+    #scan-details-dialog {
+        width: 84;
+        max-width: 92%;
+        height: auto;
+        max-height: 85%;
+        padding: 1 2;
+        border: round $accent;
+        background: $surface;
+    }
+    #scan-details-text {
+        width: 1fr;
+        height: auto;
+    }
+    """
+
+    def __init__(self, record: DirectoryRecord) -> None:
+        super().__init__()
+        self.record: DirectoryRecord = record
+
+    def compose(self) -> ComposeResult:
+        """Compose the selected row's paths, sizes, warnings, and errors."""
+
+        result = self.record.result
+        details = [
+            f"Scan details: {self.record.entry.name}",
+            f"Path: {self.record.entry.path}",
+            f"Status: {result.state.value}",
+        ]
+        if result.disk_usage_bytes is not None:
+            if result.is_ntfs:
+                disk_label = "Allocated size"
+            elif result.is_estimate:
+                disk_label = "Allocated estimate"
+            else:
+                disk_label = "Disk usage"
+            details.append(f"{disk_label}: {format_bytes(result.disk_usage_bytes)}")
+        if result.uncompressed_bytes is not None:
+            if result.is_ntfs:
+                size_label = "Logical size"
+            elif result.is_estimate:
+                size_label = "Apparent size estimate"
+            else:
+                size_label = "Uncompressed size"
+            details.append(f"{size_label}: {format_bytes(result.uncompressed_bytes)}")
+        if result.ratio is not None:
+            ratio_label = "Stored/logical ratio" if result.is_ntfs else "Ratio"
+            details.append(f"{ratio_label}: {format_ratio(result.ratio)}")
+        if result.compression_types:
+            details.append(f"Compression types: {', '.join(result.compression_types)}")
+        if result.ntfs_summary:
+            details.append(result.ntfs_summary)
+        if result.error:
+            details.extend(("", "Error:", result.error))
+        if result.warning:
+            details.extend(("", "Warning:", result.warning))
+        if not result.error and not result.warning:
+            details.extend(("", "No warning or error was reported."))
+        details.extend(("", "Esc or i: close"))
+        yield Container(
+            Static(Text("\n".join(details)), id="scan-details-text"),
+            id="scan-details-dialog",
+        )
+
+    def action_close(self) -> None:
+        """Close the scan details dialog."""
 
         self.dismiss(None)
 
@@ -2343,7 +2468,7 @@ Screen {
 }
 #column-label {
     height: 1;
-    padding: 0 1;
+    padding: 0;
     color: $text-muted;
 }
 #directory-list {
@@ -2400,6 +2525,7 @@ class CompsizerApp(App[None]):
         Binding("s", "toggle_sort", "Sort"),
         Binding("c", "toggle_cache", "Cache"),
         Binding("r", "refresh_view", "Refresh"),
+        Binding("i", "show_details", "Details"),
         Binding("?", "show_help", "Help"),
     ]
 
@@ -2453,7 +2579,13 @@ class CompsizerApp(App[None]):
                     )
             with Vertical(id="content-pane"):
                 yield Label(str(self.model.current_path), id="path-label")
-                yield Label(self._column_header(), id="column-label")
+                if isinstance(self.runner, WindowsScanRunner):
+                    ratio_label = "Stored/Logical"
+                    size_label = "Logical Size"
+                else:
+                    ratio_label = "Ratio/Used"
+                    size_label = "Size"
+                yield DirectoryColumnHeader(ratio_label, size_label)
                 yield DirectoryListView(id="directory-list")
                 yield Static("", id="empty-label")
                 yield Static("", id="status")
@@ -2920,21 +3052,6 @@ class CompsizerApp(App[None]):
             status_text = f"{_take_cells(status_text, maximum_cells - 1)}…"
         status.update(Text(status_text))
 
-    def _column_header(self) -> str:
-        """Return the fixed-column header shown above the rows."""
-
-        if isinstance(self.runner, WindowsScanRunner):
-            ratio_label = "Stored/Logical"
-            size_label = "Logical Size"
-        else:
-            ratio_label = "Ratio/Used"
-            size_label = "Size"
-        return (
-            f"{pad_right('Directory', NAME_COLUMN_WIDTH)} {'Bar':<{10}} "
-            f"{pad_left(ratio_label, RATIO_COLUMN_WIDTH)} "
-            f"{pad_left(size_label, SIZE_COLUMN_WIDTH)}"
-        )
-
     @staticmethod
     def _tree_label(path: Path) -> Text:
         """Return a safe tree label for a filesystem path."""
@@ -3213,6 +3330,20 @@ class CompsizerApp(App[None]):
         """Open the keyboard and semantics help screen."""
 
         self.push_screen(HelpScreen())
+
+    def action_show_details(self) -> None:
+        """Show full details for the selected directory scan."""
+
+        selected_path = self.model.selected_path
+        record = (
+            self.model.records.get(path_key(selected_path))
+            if selected_path is not None
+            else None
+        )
+        if record is None:
+            self._update_status("Select a directory row to show its details.")
+            return
+        self.push_screen(ScanDetailsScreen(record))
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Keep model selection attached to the highlighted path."""
