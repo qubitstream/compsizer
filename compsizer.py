@@ -6,6 +6,9 @@
 # ]
 # ///
 
+# Copyright (C) 2026 Christoph Haunschmidt
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Browse directories and filesystem size statistics in a terminal UI."""
 
 from __future__ import annotations

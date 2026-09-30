@@ -1,161 +1,109 @@
-# compsizer
+# Compsizer
 
-`compsizer` is a terminal directory browser with filesystem-specific size
-statistics. On Linux, it reports Btrfs compression through `compsize`. On
-Windows 10 or newer, it reports NTFS logical and allocated sizes.
+Find which folders use disk space without waiting for a full scan. Compsizer is
+a keyboard-driven terminal browser for Linux Btrfs and Windows NTFS. Folder
+names appear first; size results fill in as scans finish.
 
-Filesystem navigation does not wait for compression measurements. Directory
-names appear after direct enumeration, and scan results update rows as the
-bounded background scan manager receives them.
+![Compsizer Btrfs compression results](doc/compsizer.png)
+
+## Why use it?
+
+- **Keep browsing while it scans.** Compsizer measures folders in the
+  background and shows results as they arrive.
+- **See compression at a glance.** Size bars show allocated space and savings.
+  Btrfs scans show compression data; NTFS scans compare logical size with
+  allocated space and flag compressed or sparse files.
+- **Jump straight to a folder.** Enter an absolute or relative path, or find a
+  child folder by typing part of its name.
+- **Scan NTFS safely.** Windows scans read file metadata, not file contents.
+  They do not change compression settings, and hard-linked files count once.
 
 ## Requirements
 
-- Python 3.11 or newer
-- [`uv`](https://docs.astral.sh/uv/)
-- Textual (installed from the script's PEP 723 metadata)
+- Python 3.11 or newer and [`uv`](https://docs.astral.sh/uv/).
+- A terminal that supports interactive text apps. `uv` installs the app's
+  Textual dependency when you run it; no separate install step is needed.
+- **Linux:** Btrfs and `compsize` are needed for Btrfs compression data. If a
+  scan needs more permission, Compsizer asks before running `compsize` with
+  `sudo`; the app itself never runs as root. If you decline, GNU `du` from
+  coreutils is needed for estimates.
+- **Windows:** Windows 10 or newer. NTFS volumes provide size data; other
+  filesystems can be browsed without size data. The standard Command Prompt
+  (`cmd.exe`) is supported.
 
-On Linux, `compsize` and a Btrfs filesystem are needed for Btrfs compression
-statistics. GNU `du` from coreutils provides fallback size estimates. `sudo` is
-needed only if a Btrfs scan requires elevated access.
+## Run it
 
-On Windows 10 or newer, NTFS volumes provide logical and allocated-size
-statistics. Other Windows filesystems remain browsable, but do not provide size
-statistics. The app works from the standard Command Prompt (`cmd.exe`); Windows
-Terminal is not required.
-
-`compsize` uses Btrfs ioctls. Depending on the system, those operations may
-require elevated privileges. Compsizer first tries scans as the current user.
-If a scan fails because of permissions, it asks before enabling elevated scans.
-It may ask again if sudo credentials expire. Only `compsize` runs with `sudo`.
-For elevated scans, Compsizer resolves `sudo` and `compsize` from standard
-system directories, not from user-controlled `PATH` entries.
-Your account must be allowed to run `compsize` with sudo. Sudo handles any
-password prompt while the interface temporarily releases the terminal.
-Compsizer does not read or store the password, and the interface itself does
-not run as root. If authorization is declined or unavailable, the browser
-stays open and shows GNU `du` estimates for apparent size and allocated space.
-These estimates do not include Btrfs extent statistics. If `compsize` is
-missing, the browser stays open and reports scan errors.
-
-On Linux, if the starting path is on another filesystem, Compsizer shows a
-warning but continues. A child directory can be a Btrfs mount. On Windows,
-Compsizer selects the scanner from the volume for each directory scan.
-
-## Run
-
-Use the current directory as the initial location:
+From the project folder, start in the current directory:
 
 ```console
 uv run --script compsizer.py
 ```
 
-Pass a different initial directory when needed:
+On Linux, pass a starting folder:
 
 ```console
-uv run --script compsizer.py /some/btrfs/path
+uv run --script compsizer.py "$HOME/Videos"
 ```
 
-On Windows, run the same command from `cmd.exe` and pass a Windows path when
-needed:
+On Windows, run the same command from `cmd.exe`:
 
-```console
-uv run --script compsizer.py C:\Users\name\Documents
+```bat
+uv run --script compsizer.py "C:\Users\Ada\Videos"
 ```
 
-On Unix-like systems, the script's `uv` shebang also allows an executable
-checkout to start with `./compsizer.py`.
+## Use it
 
-## Controls
+| Key                      | Action                                                             |
+| ------------------------ | ------------------------------------------------------------------ |
+| `Up` / `Down`, `j` / `k` | Select a folder                                                    |
+| `Enter` or `l`           | Open the selected folder                                           |
+| `Backspace` or `h`       | Go to the parent folder                                            |
+| `Home` / `End`           | Go to the first or last folder on the page                         |
+| `PageUp` / `PageDown`    | Change directory pages                                             |
+| `Tab`                    | Switch panes; in the path prompt, complete the selected suggestion |
+| `g`                      | Enter a path or search up to 100 child folders                     |
+| `i`                      | Show details for the selected folder                               |
+| `s`                      | Change sorting: size, ratio, savings, or name                      |
+| `r`                      | Refresh the current folder and its measurements                    |
+| `c`                      | Turn the in-memory result cache on or off                          |
+| `?` / `q`                | Show help / quit                                                   |
 
-- `Up`/`Down` or `j`/`k`: move the selection
-- `Home`/`End`: select the first or last row on the current page
-- `PageUp`/`PageDown`: show the previous or next directory page
-- `Enter` or `l`: enter the selected directory
-- `Backspace` or `h`: open the parent directory
-- `Tab`: change pane focus
-- `s`: cycle between size, compression-ratio, savings, and name sorting
-- `c`: toggle the in-memory result cache
-- `r`: refresh the current directory and rescan its children
-- `g`: go to an absolute path or a path relative to the current directory;
-  suggestions search child directory names by case-insensitive substring.
-  The first match is selected. Use Up/Down to choose, Tab to complete, Enter to
-  open the typed path, or Esc to cancel.
-  The prompt shows at most 100 matches; refine the substring to narrow larger
-  result sets.
-  For UNC paths, add a divider after the share to suggest its child directories;
-  server and share names are not suggested.
-- `i`: show filesystem, scan method, byte sizes, available file counts,
-  compression details, and diagnostics
-- `?`: show help
-- `q`: quit
+**Example:** press `g` and edit the path to `../Photos` or
+`C:\Users\Ada\Photos`. To find a child folder, keep its parent path and type
+part of the folder name. Use `Up` and `Down` to choose a match, then press
+`Tab` to complete it. `Enter` opens the path in the input. Press `Esc` to
+cancel. For a network share, add a backslash after the share name to suggest
+its child folders, for example `\\server\share\`.
 
-Size sorting orders `compsize`, NTFS, and `du` results in separate groups. It
-does not compare values across groups. Ratio and savings sorting use available
-exact results. On NTFS, these values compare allocated bytes with logical
-bytes; sparse files can affect them. Fallback rows sort after exact results.
-Name sorting uses case-insensitive directory names. Pending, unavailable, and
-error rows remain below rows with known values for numeric sorts; name sorting
-includes every row in name order.
+## Read the results
 
-## Data and limitations
+- On Btrfs, `compsize` reports uncompressed extent sizes. A `~` marks a `du`
+  estimate instead of an exact Btrfs measurement.
+- On NTFS, `Logical Size` is the file's logical size. `Stored/Logical` compares
+  allocated space with logical size; sparse files can affect this ratio.
+- The flags are `C` for compressed data found, `S` for sparse NTFS files, and
+  `?` when compression status is unknown. Press `i` for scan details.
 
-- Version 1 lists directories only.
-- With `compsize`, the visible size is the uncompressed extent size. It is not
-  the apparent size reported by the `Referenced` column. After sudo is
-  declined, the visible size is `du`'s apparent size.
-- The Flags column shows `C` when a scan finds a compressed extent on Btrfs or
-  a compressed file on NTFS, `S` when an NTFS scan finds sparse files, and
-  `?` when compression status is unknown. If neither `C` nor `?` appears, a
-  complete scan found no compressed data.
-- The `i` details view shows disk-usage and uncompressed bytes by Btrfs
-  compression type when `compsize` reports them. It shows file counts when the scanner
-  provides them. NTFS counts unique file identities, so hard links count once;
-  `du` does not report a file count.
-- On NTFS, the size column shows logical file bytes and the `Stored/Logical`
-  column compares allocated bytes with logical bytes. NTFS counts appear in the
-  selected-row status and tooltip. Sparse allocation affects the ratio, so it
-  is not a compression-only measurement.
-- NTFS scans read file metadata only and count a hard-linked file once per
-  scanned tree. Automatic scans skip directory reparse points, including a row
-  whose root is a junction or mount point. The rows remain browsable; after
-  entering one, child directories are scanned according to their volume.
-  Inaccessible paths produce a partial result or an error. Windows does not
-  need an elevated process.
-- A filesystem label appears after a directory name when its filesystem differs
-  from the current location or does not support the platform's exact metrics.
-  `[link]` marks a directory reparse point that the scanner skipped.
-- Non-NTFS Windows filesystems can be browsed without size statistics.
-- The bar uses a text-colored glyph (`▓`) for allocated space and the theme's
-  success color for savings (`▒`) to the size baseline. Btrfs, NTFS, and estimate
-  results use separate bar scales. A `~` prefix marks both numeric values on
-  fallback rows: the allocated-space estimate in Ratio/Used and the apparent-size
-  estimate in Size.
-- `du` estimates are not Btrfs extent statistics. Shared extents can make
-  allocated-space totals differ from unique physical usage.
-- Independent child scans are not additive. Btrfs reflinks, deduplication,
-  shared extents, and extent waste can make sibling measurements overlap.
-- The in-memory cache lasts for one process. It is not persistent and has no
-  automatic filesystem-change invalidation.
-- Refresh is explicit. It invalidates the current directory and its child
-  results, refreshes the corresponding tree entries, and starts new
-  measurements.
-- Partial `SIGUSR1` progress is not enabled yet. Rows update when their
-  individual scans finish.
-- `compsize -x` prevents scans from crossing filesystem boundaries.
-- The right pane shows up to 100 child directories per page. Use `PageUp` and
-  `PageDown` to browse every row. The tree shows up to 100 children per
-  expanded node; use the right pane to browse additional directories.
-- All direct child directories remain queued for scanning. The selected and
-  visible rows are prioritized so useful results appear sooner without making
-  the sorted view incomplete.
+## Limitations
 
-## Development checks
+- Compsizer lists folders, not individual files.
+- Exact compression data is available for Btrfs on Linux and NTFS on Windows.
+  Other Windows filesystems remain browsable but have no size measurements.
+- `du` results are estimates, not Btrfs extent statistics. Btrfs folders can
+  share extents, so their measurements may overlap and should not be added as a
+  unique total.
+- On Windows, directory links and junctions are browsable but skipped when
+  measuring their parent folder.
+- Results are cached only while Compsizer is running. Press `r` to refresh after
+  files change.
 
-Run the tests with the same runtime dependency used by the script:
+## Run the tests
 
 ```console
 uv run --with textual python -m unittest discover -s tests -v
 ```
 
-The project instructions also require Ruff and `ty` checks for
-`compsizer.py`.
+## License
+
+Copyright (C) 2026 Christoph Haunschmidt. Compsizer is licensed under the
+[GNU General Public License v3.0 or later](LICENSE).
