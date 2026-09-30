@@ -2746,7 +2746,6 @@ class GoToPathScreen(ModalScreen[Path | None]):
         self._suggestion_changed: asyncio.Event = asyncio.Event()
         self._suggestion_task: asyncio.Task[None] | None = None
         self._validation_task: asyncio.Task[None] | None = None
-        self._checking_path: bool = False
 
     def compose(self) -> ComposeResult:
         """Compose the path entry, matching directories, and key hints."""
@@ -3005,14 +3004,11 @@ class GoToPathScreen(ModalScreen[Path | None]):
     async def _submit_path(self) -> None:
         """Validate the typed path without resolving symlinks or junctions."""
 
-        if self._checking_path:
-            return
         path_input = self.query_one("#goto-path-input", Input)
         if not path_input.value:
             self._set_path_message("Enter a directory path.", is_error=True)
             return
         target_path = absolute_child_path(self.current_path, path_input.value)
-        self._checking_path = True
         self._set_path_message("Checking directory…")
         validation_error: str | None = None
         try:
@@ -3026,8 +3022,6 @@ class GoToPathScreen(ModalScreen[Path | None]):
             LOGGER.exception("Unable to validate path %s", target_path)
             is_directory = False
             validation_error = f"Cannot check directory: {exc}"
-        finally:
-            self._checking_path = False
         if not self.is_mounted:
             return
         if not is_directory:
