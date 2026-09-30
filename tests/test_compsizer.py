@@ -1,10 +1,11 @@
 import asyncio
+import io
 import os
 import shlex
 import tempfile
 import threading
 import unittest
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,7 @@ from textual.widgets import Input, ListView, Static, Tree
 from compsizer import (
     DIRECTORY_PAGE_SIZE,
     FLAGS_COLUMN_WIDTH,
+    LOGGER,
     NAME_COLUMN_WIDTH,
     RATIO_COLUMN_WIDTH,
     SIZE_COLUMN_WIDTH,
@@ -52,13 +54,94 @@ from compsizer import (
     WindowsFileMetadata,
     WindowsScanRunner,
     _scandir_path,
+    build_argument_parser,
     enumerate_directories,
+    main,
     normalize_initial_path,
     parse_compsize_output,
     path_suggestion_query,
     render_bar,
     sort_records,
 )
+
+
+class CommandLineTests(unittest.TestCase):
+    """Test command-line options and logging setup."""
+
+    def test_log_file_option_is_opt_in(self) -> None:
+        arguments = build_argument_parser().parse_args([])
+
+        self.assertIsNone(arguments.log_file)
+
+    def test_log_file_captures_debug_without_writing_to_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            log_file = root / "compsizer.log"
+            app = MagicMock()
+
+            def write_logs() -> None:
+                LOGGER.debug("debug detail: café")
+                LOGGER.error("scan failed")
+
+            app.run.side_effect = write_logs
+            stderr = io.StringIO()
+            previous_level = LOGGER.level
+            previous_propagation = LOGGER.propagate
+
+            with (
+                patch("compsizer.CompsizerApp", return_value=app) as app_class,
+                redirect_stderr(stderr),
+            ):
+                self.assertEqual(
+                    main(["--log-file", os.fspath(log_file), os.fspath(root)]),
+                    0,
+                )
+
+            log_text = log_file.read_text(encoding="utf-8")
+            self.assertIn("DEBUG compsizer: debug detail: café", log_text)
+            self.assertIn("ERROR compsizer: scan failed", log_text)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(LOGGER.level, previous_level)
+            self.assertEqual(LOGGER.propagate, previous_propagation)
+            app_class.assert_called_once_with(root)
+
+    def test_log_handler_is_removed_after_the_app_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            log_file = root / "compsizer.log"
+            app = MagicMock()
+            app.run.side_effect = RuntimeError("TUI failed")
+            previous_handlers = tuple(LOGGER.handlers)
+            previous_level = LOGGER.level
+            previous_propagation = LOGGER.propagate
+
+            with (
+                patch("compsizer.CompsizerApp", return_value=app),
+                self.assertRaisesRegex(RuntimeError, "TUI failed"),
+            ):
+                main(["--log-file", os.fspath(log_file), os.fspath(root)])
+
+            self.assertEqual(tuple(LOGGER.handlers), previous_handlers)
+            self.assertEqual(LOGGER.level, previous_level)
+            self.assertEqual(LOGGER.propagate, previous_propagation)
+
+    def test_log_file_open_failure_does_not_start_the_app(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            log_file = root / "missing" / "compsizer.log"
+            app_class = MagicMock()
+            stderr = io.StringIO()
+
+            with (
+                patch("compsizer.CompsizerApp", app_class),
+                redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(["--log-file", os.fspath(log_file), os.fspath(root)])
+
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("Cannot open log file", stderr.getvalue())
+            app_class.assert_not_called()
 
 
 class ParserTests(unittest.TestCase):

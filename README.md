@@ -51,6 +51,14 @@ On Windows, run the same command from `cmd.exe`:
 uv run --script compsizer.py "C:\Users\Ada\Videos"
 ```
 
+To append diagnostic logs, including debug details, to a UTF-8 file:
+
+```console
+uv run --script compsizer.py --log-file compsizer.log
+```
+
+Log files may include full filesystem paths.
+
 ## Use it
 
 | Key                      | Action                                                             |

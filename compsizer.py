@@ -4268,12 +4268,37 @@ def build_argument_parser() -> argparse.ArgumentParser:
         description="Browse directories and filesystem compression statistics.",
     )
     parser.add_argument(
+        "--log-file",
+        type=Path,
+        metavar="PATH",
+        help="Append diagnostic logs to PATH (logs may include filesystem paths).",
+    )
+    parser.add_argument(
         "path",
         nargs="?",
         default=".",
         help="Initial directory to browse (default: current directory).",
     )
     return parser
+
+
+def configure_file_logging(log_file: Path) -> logging.FileHandler:
+    """Configure detailed Compsizer logging to the specified file."""
+
+    handler = logging.FileHandler(
+        log_file,
+        mode="a",
+        encoding="utf-8",
+        errors="backslashreplace",
+    )
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    LOGGER.setLevel(logging.DEBUG)
+    LOGGER.propagate = False
+    LOGGER.addHandler(handler)
+    return handler
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -4285,8 +4310,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         initial_path = normalize_initial_path(arguments.path)
     except InvalidInitialPathError as exc:
         parser.error(str(exc))
-    app = CompsizerApp(initial_path)
-    app.run()
+
+    log_handler: logging.FileHandler | None = None
+    previous_log_level = LOGGER.level
+    previous_propagation = LOGGER.propagate
+    if arguments.log_file is not None:
+        try:
+            log_handler = configure_file_logging(arguments.log_file)
+        except OSError as exc:
+            parser.error(f"Cannot open log file {arguments.log_file}: {exc}")
+
+    try:
+        app = CompsizerApp(initial_path)
+        app.run()
+    finally:
+        if log_handler is not None:
+            LOGGER.removeHandler(log_handler)
+            LOGGER.setLevel(previous_log_level)
+            LOGGER.propagate = previous_propagation
+            log_handler.close()
     return 0
 
 
