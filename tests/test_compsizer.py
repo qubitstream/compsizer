@@ -8,7 +8,9 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from textual.widgets import ListView, Static, Tree
+from rich.color import ColorTriplet
+from textual.theme import Theme
+from textual.widgets import Input, ListView, Static, Tree
 
 from compsizer import (
     DIRECTORY_PAGE_SIZE,
@@ -33,7 +35,9 @@ from compsizer import (
     ElevatedScanPrompt,
     EntryKind,
     FilesystemDetector,
+    GoToPathScreen,
     InvalidInitialPathError,
+    PathSuggestionQuery,
     ResultCache,
     ScanDetailsScreen,
     ScanJob,
@@ -43,6 +47,7 @@ from compsizer import (
     ScanResult,
     ScanState,
     SortMode,
+    ThemeStyles,
     WindowsFileApi,
     WindowsFileMetadata,
     WindowsScanRunner,
@@ -50,6 +55,7 @@ from compsizer import (
     enumerate_directories,
     normalize_initial_path,
     parse_compsize_output,
+    path_suggestion_query,
     render_bar,
     sort_records,
 )
@@ -450,6 +456,62 @@ class RenderingTests(unittest.TestCase):
 
         self.assertEqual(bar.plain, " " * 8)
 
+    def test_standalone_bar_uses_green_fallback_for_savings(self) -> None:
+        result = ScanResult(Path("/root/tree"), ScanState.COMPLETE, 4, 8, 8)
+
+        bar = render_bar(result, maximum_size=8, width=8)
+
+        self.assertEqual(bar.plain, "▓" * 4 + "▒" * 4)
+        self.assertEqual(
+            [(span.start, span.end, span.style) for span in bar.spans],
+            [(4, 8, "bright_green")],
+        )
+
+    def test_semantic_styles_use_theme_success_warning_and_error_colors(self) -> None:
+        theme = Theme(
+            name="custom-status-colors",
+            primary="#123456",
+            secondary="#654321",
+            success="#12ab34",
+            warning="#abcdef",
+            error="#fedcba",
+        )
+        result = ScanResult(Path("/root/tree"), ScanState.COMPLETE, 4, 8, 8)
+        error_result = ScanResult(Path("/root/error"), ScanState.ERROR)
+
+        styles = ThemeStyles.from_theme(theme)
+        bar = render_bar(result, maximum_size=8, width=8, theme_styles=styles)
+        error_bar = render_bar(
+            error_result, maximum_size=8, width=8, theme_styles=styles
+        )
+
+        self.assertEqual(bar.plain, "▓" * 4 + "▒" * 4)
+        self.assertEqual(bar.spans[0].style.color.triplet, ColorTriplet(18, 171, 52))
+        self.assertEqual(
+            error_bar.spans[0].style.color.triplet, ColorTriplet(254, 220, 186)
+        )
+        self.assertEqual(styles.warning.color.triplet, ColorTriplet(171, 205, 239))
+
+    def test_semantic_styles_use_theme_variable_overrides(self) -> None:
+        theme = Theme(
+            name="custom-status-overrides",
+            primary="#123456",
+            success="#12ab34",
+            warning="#abcdef",
+            error="#fedcba",
+            variables={
+                "success": "#ff00ff",
+                "warning": "#00ffff",
+                "error": "#ffff00",
+            },
+        )
+
+        styles = ThemeStyles.from_theme(theme)
+
+        self.assertEqual(styles.success.color.triplet, ColorTriplet(255, 0, 255))
+        self.assertEqual(styles.warning.color.triplet, ColorTriplet(0, 255, 255))
+        self.assertEqual(styles.error.color.triplet, ColorTriplet(255, 255, 0))
+
     def test_flags_distinguish_compressed_uncompressed_and_unknown(self) -> None:
         expected_flags = (
             (CompressionStatus.PRESENT, False, None, "C"),
@@ -559,6 +621,29 @@ class NavigationTests(unittest.TestCase):
                 [entry.name for entry in listing.entries], ["mounted-volume", "real"]
             )
 
+    def test_windows_enumeration_includes_directory_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            directory_symlink = MagicMock()
+            directory_symlink.name = "directory-link"
+            directory_symlink.is_dir.side_effect = (False, True)
+            directory_symlink.is_symlink.return_value = True
+            scanner = MagicMock()
+            scanner.__enter__.return_value = scanner
+            scanner.__exit__.return_value = None
+            scanner.__iter__.return_value = iter((directory_symlink,))
+
+            with (
+                patch("compsizer.os.name", "nt"),
+                patch("compsizer._scandir_path", return_value=os.fspath(root)),
+                patch("compsizer.os.scandir", return_value=scanner),
+            ):
+                listing = enumerate_directories(root)
+
+            self.assertEqual(
+                [entry.name for entry in listing.entries], ["directory-link"]
+            )
+
     def test_filesystem_detection_uses_the_deepest_mount_and_decodes_paths(
         self,
     ) -> None:
@@ -599,6 +684,37 @@ class NavigationTests(unittest.TestCase):
             self.assertEqual(normalize_initial_path(root / "."), root.resolve())
             with self.assertRaises(InvalidInitialPathError):
                 normalize_initial_path(file_path)
+
+    def test_path_suggestion_query_uses_the_final_path_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            parent = root / "projects"
+
+            query = path_suggestion_query(str(parent / "ComP"), root)
+            self.assertEqual(
+                query,
+                PathSuggestionQuery(parent, "ComP", f"{parent}{os.sep}"),
+            )
+
+            trailing_separator = path_suggestion_query(f"{parent}{os.sep}", root)
+            self.assertEqual(trailing_separator.parent_path, parent)
+            self.assertEqual(trailing_separator.fragment, "")
+            self.assertEqual(trailing_separator.prefix, f"{parent}{os.sep}")
+
+            relative_query = path_suggestion_query("projects/ComP", root)
+            self.assertEqual(relative_query.parent_path, parent)
+            self.assertEqual(relative_query.fragment, "ComP")
+            self.assertEqual(relative_query.prefix, "projects/")
+
+    @unittest.skipUnless(os.name == "nt", "UNC path parsing is Windows-specific")
+    def test_path_suggestions_wait_until_unc_share_is_entered(self) -> None:
+        query = path_suggestion_query(r"\\server\share", Path.cwd())
+        self.assertIsNone(query.parent_path)
+        self.assertEqual(query.fragment, "share")
+
+        share_query = path_suggestion_query(r"\\server\share\folder", Path.cwd())
+        self.assertIsNotNone(share_query.parent_path)
+        self.assertEqual(share_query.fragment, "folder")
 
     def test_selection_stays_with_path_when_results_reorder(self) -> None:
         root = Path("/root")
@@ -749,6 +865,240 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     {record.entry.name for record in app.model.records.values()},
                 )
                 await pilot.press("backspace")
+
+    async def test_go_to_path_filters_substrings_and_completes_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "Source"
+            source.mkdir()
+            (source / "Chris").mkdir()
+            (source / "XhRising").mkdir()
+            (source / "other").mkdir()
+            app = CompsizerApp(root, runner=FakeRunner())
+            enumerated_paths: list[Path] = []
+            original_enumerator = enumerate_directories
+
+            def count_enumeration(path: Path) -> DirectoryListing:
+                enumerated_paths.append(path)
+                return original_enumerator(path)
+
+            with patch(
+                "compsizer.enumerate_directories",
+                side_effect=count_enumeration,
+            ):
+                async with app.run_test(size=(110, 30)) as pilot:
+                    await pilot.press("g")
+                    self.assertIsInstance(app.screen, GoToPathScreen)
+                    path_input = app.screen.query_one("#goto-path-input", Input)
+                    path_input.value = str(source / "hRi")
+
+                    list_view = app.screen.query_one("#path-suggestions", ListView)
+                    for _ in range(100):
+                        if len(list_view.children) == 2 and list_view.index == 0:
+                            break
+                        await pilot.pause(0.01)
+
+                    self.assertEqual(
+                        [item.entry.name for item in list_view.children],
+                        ["Chris", "XhRising"],
+                    )
+                    self.assertEqual(list_view.index, 0)
+                    self.assertEqual(list_view.highlighted_child.entry.name, "Chris")
+                    self.assertEqual(enumerated_paths.count(source), 1)
+
+                    path_input.value = str(source / "hri")
+                    await pilot.pause(0.05)
+                    self.assertEqual(enumerated_paths.count(source), 1)
+
+                    await pilot.press("enter")
+                    await pilot.pause(0.02)
+                    self.assertIsInstance(app.screen, GoToPathScreen)
+                    self.assertEqual(app.model.current_path, root)
+                    error_text = app.screen.query_one(
+                        "#path-prompt-error", Static
+                    ).render()
+                    self.assertIn("Not an accessible directory", str(error_text))
+                    error_label = app.screen.query_one("#path-prompt-error", Static)
+                    self.assertTrue(error_label.has_class("is-error"))
+
+                    await pilot.press("down")
+                    self.assertEqual(
+                        list_view.highlighted_child.entry.name,
+                        "XhRising",
+                    )
+                    await pilot.press("up")
+                    self.assertEqual(list_view.highlighted_child.entry.name, "Chris")
+                    await pilot.press("tab")
+                    self.assertEqual(path_input.value, str(source / "Chris"))
+                    await pilot.press("enter")
+                    for _ in range(100):
+                        if app.model.current_path == source / "Chris":
+                            break
+                        await pilot.pause(0.01)
+
+                    self.assertEqual(app.model.current_path, source / "Chris")
+                    self.assertNotIsInstance(app.screen, GoToPathScreen)
+
+    async def test_go_to_path_escape_keeps_the_current_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "child").mkdir()
+            app = CompsizerApp(root, runner=FakeRunner())
+
+            async with app.run_test(size=(100, 25)) as pilot:
+                await pilot.press("g")
+                self.assertIsInstance(app.screen, GoToPathScreen)
+                path_input = app.screen.query_one("#goto-path-input", Input)
+                path_input.value = "hil"
+                suggestions = app.screen.query_one("#path-suggestions", ListView)
+                for _ in range(100):
+                    if (
+                        len(suggestions.children) == 1
+                        and suggestions.children[0].entry.name == "child"
+                        and suggestions.index == 0
+                    ):
+                        break
+                    await pilot.pause(0.01)
+                self.assertEqual(len(suggestions.children), 1)
+                self.assertEqual(suggestions.highlighted_child.entry.name, "child")
+                await pilot.press("tab")
+                self.assertEqual(path_input.value, "child")
+
+                path_input.value = "child"
+                await pilot.press("home")
+                self.assertEqual(path_input.cursor_position, 0)
+                await pilot.press("end")
+                self.assertEqual(path_input.cursor_position, len("child"))
+                path_input.value = ""
+                await pilot.press("c", "h", "i", "l", "d")
+                self.assertEqual(path_input.value, "child")
+                self.assertTrue(app.cache.enabled)
+                await pilot.press("escape")
+                self.assertEqual(app.model.current_path, root)
+                self.assertNotIsInstance(app.screen, GoToPathScreen)
+
+    async def test_go_to_path_arrows_select_matches_after_typing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "bar").mkdir()
+            (root / "baz").mkdir()
+            (root / "other").mkdir()
+            app = CompsizerApp(root, runner=FakeRunner())
+
+            async with app.run_test(size=(100, 25)) as pilot:
+                await pilot.press("g")
+                self.assertIsInstance(app.screen, GoToPathScreen)
+                path_input = app.screen.query_one("#goto-path-input", Input)
+                path_input.value = ""
+                await pilot.press("b", "a")
+
+                suggestions = app.screen.query_one("#path-suggestions", ListView)
+                for _ in range(100):
+                    if len(suggestions.children) == 2:
+                        break
+                    await pilot.pause(0.01)
+
+                self.assertEqual(
+                    [item.entry.name for item in suggestions.children],
+                    ["bar", "baz"],
+                )
+                self.assertEqual(suggestions.index, 0)
+                self.assertIs(app.focused, path_input)
+
+                await pilot.press("down")
+                self.assertEqual(suggestions.index, 1)
+                self.assertEqual(
+                    suggestions.highlighted_child.entry.name,
+                    "baz",
+                )
+                await pilot.press("up")
+                self.assertEqual(suggestions.index, 0)
+                self.assertEqual(
+                    suggestions.highlighted_child.entry.name,
+                    "bar",
+                )
+
+                await pilot.press("down", "tab")
+                self.assertEqual(path_input.value, "baz")
+
+    async def test_go_to_path_limits_rendered_suggestions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source"
+            source.mkdir()
+            entries = tuple(
+                DirectoryEntry(source / f"child-{index:03}", f"child-{index:03}")
+                for index in range(101)
+            )
+            app = CompsizerApp(root, runner=FakeRunner())
+            original_enumerator = enumerate_directories
+
+            def enumerate_with_large_parent(path: Path) -> DirectoryListing:
+                if path == source:
+                    return DirectoryListing(source, entries)
+                return original_enumerator(path)
+
+            with patch(
+                "compsizer.enumerate_directories",
+                side_effect=enumerate_with_large_parent,
+            ):
+                async with app.run_test(size=(110, 30)) as pilot:
+                    await pilot.press("g")
+                    path_input = app.screen.query_one("#goto-path-input", Input)
+                    path_input.value = f"{source}{os.sep}"
+                    list_view = app.screen.query_one("#path-suggestions", ListView)
+                    status_label = app.screen.query_one(
+                        "#path-suggestion-status", Static
+                    )
+                    for _ in range(100):
+                        status_text = str(status_label.render())
+                        if (
+                            len(list_view.children) == 100
+                            and "Showing first 100 of 101" in status_text
+                        ):
+                            break
+                        await pilot.pause(0.01)
+
+                    self.assertEqual(len(list_view.children), 100)
+                    status_text = status_label.render()
+                    self.assertIn("Showing first 100 of 101", str(status_text))
+
+    async def test_go_to_path_cancel_during_validation_stays_responsive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            child = root / "child"
+            child.mkdir()
+            app = CompsizerApp(root, runner=FakeRunner())
+            validation_started = threading.Event()
+            release_validation = threading.Event()
+
+            def blocked_is_directory(_path: str) -> bool:
+                validation_started.set()
+                release_validation.wait()
+                return True
+
+            async with app.run_test(size=(100, 25)) as pilot:
+                await pilot.press("g")
+                path_input = app.screen.query_one("#goto-path-input", Input)
+                path_input.value = str(child)
+
+                with patch(
+                    "compsizer.os.path.isdir",
+                    side_effect=blocked_is_directory,
+                ):
+                    try:
+                        await pilot.press("enter")
+                        for _ in range(100):
+                            if validation_started.is_set():
+                                break
+                            await pilot.pause(0.01)
+                        self.assertTrue(validation_started.is_set())
+
+                        await pilot.press("escape")
+                        self.assertNotIsInstance(app.screen, GoToPathScreen)
+                        self.assertEqual(app.model.current_path, root)
+                    finally:
+                        release_validation.set()
 
     async def test_error_rows_wait_for_refresh_before_retrying(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1007,7 +1357,7 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 row_text = row.render().plain
 
                 self.assertEqual(header.size.width, row.size.width)
-                self.assertEqual(header_text.index("Bar"), row_text.index("█"))
+                self.assertEqual(header_text.index("Bar"), row_text.index("▓"))
                 self.assertEqual(
                     header_text.rindex("Ratio/Used") + len("Ratio/Used"),
                     row_text.rindex("10.0%") + len("10.0%"),
@@ -1030,7 +1380,11 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 help_text = app.screen.query_one("#help-text", Static).render().plain
-                self.assertIn("size baseline (░). On Btrfs", help_text)
+                self.assertIn(
+                    "allocated usage (▓) in the text color and savings (▒) "
+                    "in the theme's success color",
+                    help_text,
+                )
                 self.assertIn("uncompressed extent bytes. On NTFS", help_text)
                 self.assertIn("allocated bytes with logical bytes", help_text)
 
@@ -1204,21 +1558,38 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
             root = Path(temporary_directory)
             for index in range(40):
                 (root / f"directory-{index:02d}").mkdir()
-            app = CompsizerApp(root, runner=FakeRunner(delay=1.0))
+            app = CompsizerApp(root, runner=FakeRunner(delay=10.0))
 
             async with app.run_test(size=(120, 30)) as pilot:
                 await pilot.pause(0.1)
                 directory_list = app.query_one("#directory-list", ListView)
-                for _ in range(20):
-                    if directory_list.index is not None:
+                for _ in range(100):
+                    if len(directory_list.children) == 40:
                         break
                     await pilot.pause(0.01)
+                self.assertEqual(len(directory_list.children), 40)
+                for _ in range(100):
+                    row_render_task = app._row_refresh_task
+                    if directory_list.max_scroll_y > 0 and (
+                        row_render_task is None or row_render_task.done()
+                    ):
+                        break
+                    await pilot.pause(0.01)
+                self.assertGreater(directory_list.max_scroll_y, 0)
+                await pilot.pause(0.05)
+                app.set_focus(directory_list)
                 await pilot.press("end")
-                await pilot.pause(0.01)
+                for _ in range(100):
+                    if directory_list.index == 39 and directory_list.scroll_y > 0:
+                        break
+                    await pilot.pause(0.01)
                 self.assertEqual(directory_list.index, 39)
                 self.assertGreater(directory_list.scroll_y, 0)
                 await pilot.press("home")
-                await pilot.pause(0.01)
+                for _ in range(100):
+                    if directory_list.index == 0 and directory_list.scroll_y == 0:
+                        break
+                    await pilot.pause(0.01)
                 self.assertEqual(directory_list.index, 0)
                 self.assertEqual(directory_list.scroll_y, 0)
 
@@ -1226,26 +1597,71 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             values = {f"directory-{index:02d}": (index + 1) * 100 for index in range(8)}
-            app = CompsizerApp(
-                root,
-                runner=FakeRunner(delay=0.15, uncompressed_by_name=values),
-            )
+
+            class GatedRunner(FakeRunner):
+                """Hold scan results until the test confirms the first selection."""
+
+                def __init__(self) -> None:
+                    super().__init__(delay=0.15, uncompressed_by_name=values)
+                    self.release_scans: asyncio.Event = asyncio.Event()
+
+                async def scan(self, path: Path) -> ScanResult:
+                    await self.release_scans.wait()
+                    return await super().scan(path)
+
+            runner = GatedRunner()
+            app = CompsizerApp(root, runner=runner)
             for name in values:
                 (root / name).mkdir()
 
             async with app.run_test(size=(120, 20)) as pilot:
-                await pilot.pause(0.03)
                 directory_list = app.query_one("#directory-list", ListView)
+                for _ in range(100):
+                    highlighted = directory_list.highlighted_child
+                    highlighted_row = (
+                        next(iter(highlighted.query(DirectoryRow)), None)
+                        if highlighted is not None
+                        else None
+                    )
+                    if (
+                        len(directory_list.children) == len(values)
+                        and app.model.selected_path == root / "directory-00"
+                        and highlighted_row is not None
+                        and highlighted_row.record.entry.path == root / "directory-00"
+                    ):
+                        break
+                    await pilot.pause(0.01)
+                self.assertEqual(len(directory_list.children), len(values))
+                self.assertEqual(app.model.selected_path, root / "directory-00")
+                self.assertIsNotNone(highlighted_row)
+                self.assertEqual(
+                    highlighted_row.record.entry.path, root / "directory-00"
+                )
                 await pilot.press("down")
                 selected_path = root / "directory-01"
                 self.assertEqual(app.model.selected_path, selected_path)
-                await pilot.pause(1.0)
-                highlighted = directory_list.highlighted_child
-                if highlighted is None:
-                    self.fail("The directory list has no highlighted row.")
-                row = highlighted.query_one(DirectoryRow)
+                runner.release_scans.set()
+                for _ in range(200):
+                    highlighted = directory_list.highlighted_child
+                    highlighted_row = (
+                        next(iter(highlighted.query(DirectoryRow)), None)
+                        if highlighted is not None
+                        else None
+                    )
+                    if (
+                        app.model.state_counts[ScanState.COMPLETE] == len(values)
+                        and app.model.selected_path == selected_path
+                        and highlighted_row is not None
+                        and highlighted_row.record.entry.path == selected_path
+                    ):
+                        break
+                    await pilot.pause(0.01)
+                self.assertEqual(
+                    app.model.state_counts[ScanState.COMPLETE], len(values)
+                )
                 self.assertEqual(app.model.selected_path, selected_path)
-                self.assertEqual(row.record.entry.path, selected_path)
+                self.assertIsNotNone(highlighted_row)
+                self.assertEqual(highlighted_row.record.entry.path, selected_path)
 
     async def test_late_ui_work_is_ignored_after_unmount(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -28,16 +28,28 @@ from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
 from rich.cells import cell_len
+from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
+from textual.color import Color, ColorParseError
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widget import MountError
-from textual.widgets import Footer, Header, Label, ListItem, ListView, Static, Tree
+from textual.widgets import (
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Static,
+    Tree,
+)
 from textual.widgets.tree import TreeNode
 
 LOGGER = logging.getLogger("compsizer")
@@ -45,6 +57,7 @@ LOGGER = logging.getLogger("compsizer")
 DEFAULT_CONCURRENCY = 2
 DIRECTORY_PAGE_SIZE = 100
 TREE_CHILD_LIMIT = 100
+PATH_SUGGESTION_LIMIT = 100
 MAX_DIAGNOSTIC_LENGTH = 500
 ROW_REFRESH_DELAY = 0.02
 # Do not resolve elevated commands through the user's environment PATH.
@@ -61,7 +74,7 @@ SYSTEM_EXECUTABLE_DIRECTORIES: tuple[str, ...] = (
     else ()
 )
 SYSTEM_EXECUTABLE_PATH = os.pathsep.join(SYSTEM_EXECUTABLE_DIRECTORIES)
-BAR_STYLE = "green"
+DEFAULT_BAR_SAVINGS_STYLE = "bright_green"
 NAME_COLUMN_WIDTH = 26
 RATIO_COLUMN_WIDTH = 14
 SIZE_COLUMN_WIDTH = 13
@@ -154,6 +167,15 @@ class DirectoryListing:
     entries: tuple[DirectoryEntry, ...] = ()
     warning: str | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PathSuggestionQuery:
+    """Describe the parent directory and final segment in a path prompt."""
+
+    parent_path: Path | None
+    fragment: str
+    prefix: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +418,47 @@ def absolute_child_path(parent: Path, name: str) -> Path:
     """Build an absolute child path without resolving symlinks."""
 
     return Path(os.path.abspath(os.path.join(os.fspath(parent), name)))
+
+
+def path_suggestion_query(value: str, base_path: Path) -> PathSuggestionQuery:
+    """Split an entered path into a directory to search and a name fragment.
+
+    On Windows, both slash styles are recognized. Incomplete UNC server or
+    share paths do not enumerate a server root; suggestions start inside an
+    existing share.
+    """
+
+    separators = ("/", "\\") if os.name == "nt" else ("/",)
+    separator_index = max(value.rfind(separator) for separator in separators)
+    if separator_index >= 0 and value.endswith(separators):
+        parent_text = value
+        fragment = ""
+        prefix = value
+    elif separator_index < 0:
+        parent_text = ""
+        fragment = value
+        prefix = ""
+    elif separator_index == 0:
+        parent_text = value[:1]
+        fragment = value[1:]
+        prefix = value[:1]
+    else:
+        parent_text = value[:separator_index]
+        fragment = value[separator_index + 1 :]
+        prefix = value[: separator_index + 1]
+
+    if os.name == "nt" and value.startswith(("\\\\", "//")):
+        unc_parent_text = value[:separator_index] if separator_index >= 0 else ""
+        unc_components = tuple(
+            part for part in re.split(r"[\\/]+", unc_parent_text.lstrip("\\/")) if part
+        )
+        if len(unc_components) < 2:
+            return PathSuggestionQuery(None, fragment, prefix)
+
+    parent_path = (
+        base_path if not parent_text else absolute_child_path(base_path, parent_text)
+    )
+    return PathSuggestionQuery(parent_path, fragment, prefix)
 
 
 class FilesystemDetector:
@@ -692,10 +755,12 @@ def _scandir_path(path: Path) -> str:
 
 
 def enumerate_directories(path: Path) -> DirectoryListing:
-    """Enumerate direct child directories without following symlinks.
+    """Enumerate direct child directories without recursing into symlinks.
 
-    The function does not recurse. It is suitable for running in a worker
-    thread so a slow filesystem cannot block the Textual event loop.
+    On Windows, directory symlinks are listed so users can browse them. The
+    scan runner still treats each reparse point as a scan boundary. This
+    function is suitable for a worker thread so a slow filesystem cannot block
+    the Textual event loop.
     """
 
     entries: list[DirectoryEntry] = []
@@ -704,7 +769,10 @@ def enumerate_directories(path: Path) -> DirectoryListing:
         with os.scandir(_scandir_path(path)) as directory:
             for entry in directory:
                 try:
-                    if not entry.is_dir(follow_symlinks=False):
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                    if not is_directory and os.name == "nt" and entry.is_symlink():
+                        is_directory = entry.is_dir()
+                    if not is_directory:
                         continue
                     entries.append(
                         DirectoryEntry(
@@ -2240,12 +2308,49 @@ class BarScales:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ThemeStyles:
+    """Rich styles resolved from Textual's semantic theme colors."""
+
+    success: Style
+    warning: Style
+    error: Style
+
+    @classmethod
+    def from_theme(cls, theme: Theme) -> ThemeStyles:
+        """Resolve success, warning, and error colors with Textual fallbacks."""
+
+        colors = theme.to_color_system()
+        primary = colors.primary
+        secondary = colors.secondary or primary
+
+        def semantic_style(name: str, color: Color) -> Style:
+            """Apply a theme variable override when Rich can represent it."""
+
+            override = theme.variables.get(name)
+            if override is not None:
+                try:
+                    color = Color.parse(override)
+                except ColorParseError:
+                    # Context-dependent CSS colors have no Rich Text equivalent.
+                    pass
+            return Style(color=color.rich_color)
+
+        return cls(
+            success=semantic_style("success", colors.success or secondary),
+            warning=semantic_style("warning", colors.warning or primary),
+            error=semantic_style("error", colors.error or secondary),
+        )
+
+
 def render_bar(
     result: ScanResult,
     maximum_size: int,
     width: int,
+    *,
+    theme_styles: ThemeStyles | None = None,
 ) -> Text:
-    """Render allocated usage and the difference to the size baseline."""
+    """Render allocated usage in text color and savings in the theme style."""
 
     bar = Text()
     if width <= 0:
@@ -2262,15 +2367,25 @@ def render_bar(
         disk_fraction = max(0.0, result.disk_usage_bytes / maximum_size)
         logical_cells = min(width, round(width * logical_fraction))
         disk_cells = min(width, round(width * disk_fraction))
-        bar.append("█" * disk_cells, style=BAR_STYLE)
-        bar.append("░" * max(0, logical_cells - disk_cells), style=BAR_STYLE)
+        bar.append("▓" * disk_cells)
+        bar.append(
+            "▒" * max(0, logical_cells - disk_cells),
+            style=(
+                theme_styles.success
+                if theme_styles is not None
+                else DEFAULT_BAR_SAVINGS_STYLE
+            ),
+        )
         bar.append(" " * max(0, width - max(logical_cells, disk_cells)))
         return bar
     if result.state is ScanState.UNAVAILABLE:
         bar.append("·" * width, style="dim")
         return bar
     if result.state is ScanState.ERROR:
-        bar.append("!" * width, style="red")
+        bar.append(
+            "!" * width,
+            style=theme_styles.error if theme_styles is not None else "red",
+        )
     else:
         bar.append("·" * width, style="dim")
     return bar
@@ -2396,11 +2511,20 @@ class DirectoryRow(Static):
             ratio_or_used = "—"
             size = "—"
 
+        theme_styles: ThemeStyles | None = None
+        if self.is_attached:
+            theme_styles = ThemeStyles.from_theme(self.app.current_theme)
+
         line = Text()
         line.append(pad_right(name, NAME_COLUMN_WIDTH))
         line.append(" ")
         line.append(
-            render_bar(result, self.bar_scales.maximum_for(result), graph_width)
+            render_bar(
+                result,
+                self.bar_scales.maximum_for(result),
+                graph_width,
+                theme_styles=theme_styles,
+            )
         )
         line.append(" ")
         ratio_start = len(line.plain)
@@ -2411,11 +2535,19 @@ class DirectoryRow(Static):
         line.append(" ")
         line.append(pad_right(flags, FLAGS_COLUMN_WIDTH))
         if result.state is ScanState.ERROR:
-            line.stylize("red", ratio_start, len(line.plain))
+            line.stylize(
+                theme_styles.error if theme_styles is not None else "red",
+                ratio_start,
+                len(line.plain),
+            )
         elif result.state in {ScanState.RUNNING, ScanState.UNAVAILABLE}:
             line.stylize("dim", ratio_start, len(line.plain))
         elif result.warning:
-            line.stylize("yellow", ratio_start, size_start)
+            line.stylize(
+                theme_styles.warning if theme_styles is not None else "yellow",
+                ratio_start,
+                size_start,
+            )
         return line
 
     @staticmethod
@@ -2492,11 +2624,14 @@ class HelpScreen(ModalScreen[None]):
             "s               Cycle size / ratio / savings / name sorting\n"
             "c               Toggle result cache\n"
             "r               Refresh current directory and rescan\n"
+            "g               Go to a path; search child names by substring\n"
             "i               Show selected row details\n"
             "?               Show this help\n"
             "q               Quit\n\n"
-            "Bars show allocated usage (█) and the difference to the size "
-            "baseline (░). On Btrfs, the size column shows uncompressed "
+            "Bars show allocated usage (▓) in the text color and savings (▒) "
+            "in the theme's success color. On Btrfs, "
+            "the size column "
+            "shows uncompressed "
             "extent bytes. On NTFS, it shows logical size; Stored/Logical "
             "compares allocated bytes with logical bytes. Flags use C for "
             "found compressed data, S for found NTFS sparse files, and ? when "
@@ -2520,6 +2655,388 @@ class HelpScreen(ModalScreen[None]):
         """Close the help dialog."""
 
         self.dismiss(None)
+
+
+class PathPromptInput(Input):
+    """Route arrow keys from the focused path field to its suggestions."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("up", "suggestion_up", "Previous suggestion", show=False),
+        Binding("down", "suggestion_down", "Next suggestion", show=False),
+    ]
+
+    def action_suggestion_up(self) -> None:
+        """Move the owning prompt's suggestion selection upward."""
+
+        if isinstance(self.screen, GoToPathScreen):
+            self.screen.action_suggestion_up()
+
+    def action_suggestion_down(self) -> None:
+        """Move the owning prompt's suggestion selection downward."""
+
+        if isinstance(self.screen, GoToPathScreen):
+            self.screen.action_suggestion_down()
+
+
+class PathSuggestionItem(ListItem):
+    """Display one directory that can complete the path prompt."""
+
+    def __init__(self, entry: DirectoryEntry) -> None:
+        super().__init__(Static(Text(entry.name, no_wrap=True, overflow="ellipsis")))
+        self.entry: DirectoryEntry = entry
+
+
+class GoToPathScreen(ModalScreen[Path | None]):
+    """Prompt for a directory path and suggest matching child directories."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "cancel", "Cancel", show=False, priority=True),
+        Binding("tab", "accept_suggestion", "Complete", show=False, priority=True),
+    ]
+
+    CSS = """
+    GoToPathScreen {
+        align: center middle;
+    }
+    #path-prompt-dialog {
+        width: 88;
+        max-width: 95%;
+        height: 22;
+        max-height: 85%;
+        padding: 1 2;
+        border: round $accent;
+        background: $surface;
+    }
+    #path-prompt-title, #path-prompt-hint {
+        height: 1;
+    }
+    #path-prompt-error, #path-suggestion-status {
+        height: 1;
+        overflow-x: hidden;
+        overflow-y: hidden;
+        text-overflow: ellipsis;
+    }
+    #path-prompt-error {
+        color: $text-muted;
+    }
+    #path-prompt-error.is-error {
+        color: $error;
+    }
+    #path-suggestion-status {
+        color: $text-muted;
+    }
+    #path-suggestions {
+        height: 1fr;
+        min-height: 3;
+    }
+    #path-suggestions > ListItem.-highlight {
+        color: $block-cursor-foreground;
+        text-style: $block-cursor-text-style;
+    }
+    """
+
+    def __init__(self, current_path: Path) -> None:
+        super().__init__()
+        self.current_path: Path = current_path
+        self._query: PathSuggestionQuery = path_suggestion_query(
+            str(current_path), current_path
+        )
+        self._requested_parent: Path | None = None
+        self._cached_listing: DirectoryListing | None = None
+        self._suggestion_changed: asyncio.Event = asyncio.Event()
+        self._suggestion_task: asyncio.Task[None] | None = None
+        self._validation_task: asyncio.Task[None] | None = None
+        self._checking_path: bool = False
+
+    def compose(self) -> ComposeResult:
+        """Compose the path entry, matching directories, and key hints."""
+
+        with Vertical(id="path-prompt-dialog"):
+            yield Label("Go to directory", id="path-prompt-title")
+            yield PathPromptInput(
+                value=str(self.current_path),
+                placeholder="Absolute path or path relative to the current directory",
+                id="goto-path-input",
+            )
+            yield Static("", id="path-prompt-error")
+            yield Static("Matching child directories", id="path-suggestion-status")
+            yield ListView(id="path-suggestions")
+            yield Label(
+                "Up/Down choose  Tab complete  Enter typed path  Esc cancel",
+                id="path-prompt-hint",
+            )
+
+    async def on_mount(self) -> None:
+        """Focus the input and start the single suggestion loader."""
+
+        self._suggestion_task = asyncio.create_task(self._suggestion_worker())
+        path_input = self.query_one("#goto-path-input", Input)
+        path_input.focus()
+        await self._refresh_suggestions(path_input.value)
+
+    async def on_unmount(self) -> None:
+        """Stop prompt-owned filesystem tasks when the prompt closes."""
+
+        tasks = tuple(
+            task
+            for task in (self._suggestion_task, self._validation_task)
+            if task is not None
+        )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        """Refresh matching names when the path text changes."""
+
+        if event.input.id == "goto-path-input":
+            await self._refresh_suggestions(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Start validating the typed path without blocking input handling."""
+
+        if event.input.id == "goto-path-input":
+            event.stop()
+            if self._validation_task is None or self._validation_task.done():
+                self._validation_task = asyncio.create_task(self._submit_path())
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Complete a suggestion selected with the mouse or Enter key."""
+
+        if isinstance(event.item, PathSuggestionItem):
+            event.stop()
+            self._accept_entry(event.item.entry)
+
+    def action_cancel(self) -> None:
+        """Close the prompt without changing the current directory."""
+
+        self.dismiss(None)
+
+    def action_suggestion_up(self) -> None:
+        """Move the suggestion cursor up without changing the path text."""
+
+        self._move_suggestion(-1)
+
+    def action_suggestion_down(self) -> None:
+        """Move the suggestion cursor down without changing the path text."""
+
+        self._move_suggestion(1)
+
+    def action_accept_suggestion(self) -> None:
+        """Replace the final path segment with the selected suggestion."""
+
+        list_view = self.query_one("#path-suggestions", ListView)
+        item = list_view.highlighted_child
+        if isinstance(item, PathSuggestionItem):
+            self._accept_entry(item.entry)
+
+    def _move_suggestion(self, offset: int) -> None:
+        """Choose an initial endpoint, then clamp movement to available items."""
+
+        list_view = self.query_one("#path-suggestions", ListView)
+        item_count = len(list_view.children)
+        if not item_count:
+            return
+        if list_view.index is None:
+            target_index = 0 if offset > 0 else item_count - 1
+        else:
+            target_index = max(0, min(item_count - 1, list_view.index + offset))
+        list_view.index = target_index
+
+    def _accept_entry(self, entry: DirectoryEntry) -> None:
+        """Complete the current final path segment with one directory name."""
+
+        path_input = self.query_one("#goto-path-input", Input)
+        completed_value = f"{self._query.prefix}{entry.name}"
+        path_input.value = completed_value
+        path_input.cursor_position = len(completed_value)
+        path_input.focus()
+
+    def _set_path_message(self, message: str, *, is_error: bool = False) -> None:
+        """Show prompt feedback with semantic styling for validation errors."""
+
+        error_label = self.query_one("#path-prompt-error", Static)
+        error_label.update(message)
+        if is_error:
+            error_label.add_class("is-error")
+        else:
+            error_label.remove_class("is-error")
+
+    async def _refresh_suggestions(self, value: str) -> None:
+        """Filter the cached parent listing or request its asynchronous load."""
+
+        self._query = path_suggestion_query(value, self.current_path)
+        self._set_path_message("")
+        parent_path = self._query.parent_path
+        if parent_path is None:
+            self._requested_parent = None
+            self._suggestion_changed.set()
+            await self._clear_suggestions(
+                "Add a divider after a UNC share to suggest its child directories."
+            )
+            return
+
+        parent_key = path_key(parent_path)
+        self._requested_parent = parent_path
+        if (
+            self._cached_listing is not None
+            and path_key(self._cached_listing.path) == parent_key
+        ):
+            await self._render_listing(self._cached_listing)
+            return
+
+        self.query_one("#path-suggestion-status", Static).update(
+            f"Loading directories in {parent_path}…"
+        )
+        await self._clear_suggestions()
+        self._suggestion_changed.set()
+
+    async def _suggestion_worker(self) -> None:
+        """Load one parent at a time and coalesce changes to the requested path."""
+
+        while True:
+            await self._suggestion_changed.wait()
+            self._suggestion_changed.clear()
+            parent_path = self._requested_parent
+            if parent_path is None:
+                continue
+            parent_key = path_key(parent_path)
+            if (
+                self._cached_listing is not None
+                and path_key(self._cached_listing.path) == parent_key
+            ):
+                listing = self._cached_listing
+            else:
+                try:
+                    listing = await asyncio.to_thread(
+                        enumerate_directories,
+                        parent_path,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # pragma: no cover - worker boundary
+                    LOGGER.exception(
+                        "Unable to load path suggestions from %s", parent_path
+                    )
+                    listing = DirectoryListing(
+                        path=parent_path,
+                        error=f"Cannot read directory {parent_path}: {exc}",
+                    )
+                self._cached_listing = listing
+
+            if not self.is_mounted:
+                return
+            requested_parent = self._requested_parent
+            if (
+                requested_parent is not None
+                and path_key(requested_parent) == parent_key
+            ):
+                await self._render_listing(listing)
+
+    async def _render_listing(self, listing: DirectoryListing) -> None:
+        """Filter and display directory names for the current path fragment."""
+
+        if listing.error is not None:
+            await self._clear_suggestions(listing.error)
+            return
+        fragment = self._query.fragment.casefold()
+        matches: list[DirectoryEntry] = []
+        match_count = 0
+        for entry in listing.entries:
+            if fragment not in entry.name.casefold():
+                continue
+            match_count += 1
+            if len(matches) < PATH_SUGGESTION_LIMIT:
+                matches.append(entry)
+        list_view = self.query_one("#path-suggestions", ListView)
+        selected_item = list_view.highlighted_child
+        selected_path = (
+            selected_item.entry.path
+            if isinstance(selected_item, PathSuggestionItem)
+            else None
+        )
+        existing_items = tuple(
+            item for item in list_view.children if isinstance(item, PathSuggestionItem)
+        )
+        if tuple(path_key(item.entry.path) for item in existing_items) != tuple(
+            path_key(entry.path) for entry in matches
+        ):
+            await list_view.clear()
+            if matches:
+                await list_view.mount(*(PathSuggestionItem(entry) for entry in matches))
+        selected_index = (
+            next(
+                (
+                    index
+                    for index, entry in enumerate(matches)
+                    if path_key(entry.path) == path_key(selected_path)
+                ),
+                None,
+            )
+            if selected_path is not None
+            else None
+        )
+        if selected_index is None and matches:
+            selected_index = 0
+        list_view.index = selected_index
+
+        if match_count > len(matches):
+            status = (
+                f"Showing first {len(matches)} of {match_count} matching directories"
+            )
+        else:
+            noun = "directory" if match_count == 1 else "directories"
+            status = f"{match_count} matching {noun}"
+        self.query_one("#path-suggestion-status", Static).update(
+            f"{status} in {listing.path}"
+        )
+
+    async def _clear_suggestions(self, status: str | None = None) -> None:
+        """Remove stale suggestions and optionally show a listing status."""
+
+        list_view = self.query_one("#path-suggestions", ListView)
+        if list_view.children:
+            await list_view.clear()
+        list_view.index = None
+        if status is not None:
+            self.query_one("#path-suggestion-status", Static).update(status)
+
+    async def _submit_path(self) -> None:
+        """Validate the typed path without resolving symlinks or junctions."""
+
+        if self._checking_path:
+            return
+        path_input = self.query_one("#goto-path-input", Input)
+        if not path_input.value:
+            self._set_path_message("Enter a directory path.", is_error=True)
+            return
+        target_path = absolute_child_path(self.current_path, path_input.value)
+        self._checking_path = True
+        self._set_path_message("Checking directory…")
+        validation_error: str | None = None
+        try:
+            is_directory = await asyncio.to_thread(
+                os.path.isdir,
+                _scandir_path(target_path),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - worker boundary safeguard
+            LOGGER.exception("Unable to validate path %s", target_path)
+            is_directory = False
+            validation_error = f"Cannot check directory: {exc}"
+        finally:
+            self._checking_path = False
+        if not self.is_mounted:
+            return
+        if not is_directory:
+            error_message = validation_error or (
+                f"Not an accessible directory: {target_path}"
+            )
+            self._set_path_message(error_message, is_error=True)
+            return
+        self.dismiss(target_path)
 
 
 class ScanDetailsScreen(ModalScreen[None]):
@@ -2795,6 +3312,7 @@ class CompsizerApp(App[None]):
         Binding("s", "toggle_sort", "Sort"),
         Binding("c", "toggle_cache", "Cache"),
         Binding("r", "refresh_view", "Refresh"),
+        Binding("g", "go_to_path", "Go to path"),
         Binding("i", "show_details", "Details"),
         Binding("?", "show_help", "Help"),
     ]
@@ -3185,7 +3703,10 @@ class CompsizerApp(App[None]):
                 list_view.index = selected_index
             for index, item in enumerate(current_items):
                 item.highlighted = index == selected_index
-            empty_label = self.query_one("#empty-label", Static)
+            try:
+                empty_label = self.query_one("#empty-label", Static)
+            except NoMatches:
+                return
             if records:
                 empty_label.update("")
             elif self.model.listing_error:
@@ -3537,11 +4058,15 @@ class CompsizerApp(App[None]):
     def action_previous_page(self) -> None:
         """Show the previous page of directory rows."""
 
+        if isinstance(self.focused, Input):
+            return
         self._change_page(-1)
 
     def action_next_page(self) -> None:
         """Show the next page of directory rows."""
 
+        if isinstance(self.focused, Input):
+            return
         self._change_page(1)
 
     def _change_page(self, delta: int) -> None:
@@ -3588,7 +4113,9 @@ class CompsizerApp(App[None]):
         """Move the focused pane to its first item and reveal it."""
 
         focused = self.focused
-        if isinstance(focused, ListView):
+        if isinstance(focused, Input):
+            focused.action_home()
+        elif isinstance(focused, ListView):
             self._set_list_selection(focused, 0, ensure_visible=True)
         elif isinstance(focused, Tree) and focused.last_line >= 0:
             focused.move_cursor_to_line(0, animate=False)
@@ -3597,7 +4124,9 @@ class CompsizerApp(App[None]):
         """Move the focused pane to its last item and reveal it."""
 
         focused = self.focused
-        if isinstance(focused, ListView):
+        if isinstance(focused, Input):
+            focused.action_end()
+        elif isinstance(focused, ListView):
             self._set_list_selection(focused, -1, ensure_visible=True)
         elif isinstance(focused, Tree) and focused.last_line >= 0:
             focused.move_cursor_to_line(focused.last_line, animate=False)
@@ -3651,6 +4180,22 @@ class CompsizerApp(App[None]):
         if isinstance(self.runner, CompsizeRunner):
             self.runner.reset_privilege_decision()
         self._navigate_to(self.model.current_path, refresh=True)
+
+    def action_go_to_path(self) -> None:
+        """Open a prompt for direct navigation to a typed directory path."""
+
+        self.push_screen(
+            GoToPathScreen(self.model.current_path),
+            callback=self._on_go_to_path_result,
+        )
+
+    def _on_go_to_path_result(self, path: Path | None) -> None:
+        """Apply a validated path or refresh the view after cancellation."""
+
+        if path is None:
+            self._schedule_row_render()
+            return
+        self._navigate_to(path)
 
     def action_show_help(self) -> None:
         """Open the keyboard and semantics help screen."""

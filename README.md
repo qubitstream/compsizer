@@ -76,6 +76,14 @@ checkout to start with `./compsizer.py`.
 - `s`: cycle between size, compression-ratio, savings, and name sorting
 - `c`: toggle the in-memory result cache
 - `r`: refresh the current directory and rescan its children
+- `g`: go to an absolute path or a path relative to the current directory;
+  suggestions search child directory names by case-insensitive substring.
+  The first match is selected. Use Up/Down to choose, Tab to complete, Enter to
+  open the typed path, or Esc to cancel.
+  The prompt shows at most 100 matches; refine the substring to narrow larger
+  result sets.
+  For UNC paths, add a divider after the share to suggest its child directories;
+  server and share names are not suggested.
 - `i`: show filesystem, scan method, byte sizes, available file counts,
   compression details, and diagnostics
 - `?`: show help
@@ -117,10 +125,10 @@ includes every row in name order.
   from the current location or does not support the platform's exact metrics.
   `[link]` marks a directory reparse point that the scanner skipped.
 - Non-NTFS Windows filesystems can be browsed without size statistics.
-- The bar uses a solid glyph for allocated space and a separate glyph for the
-  difference to the size baseline. Btrfs, NTFS, and estimate results use
-  separate bar scales. A `~` prefix marks both numeric values on fallback
-  rows: the allocated-space estimate in Ratio/Used and the apparent-size
+- The bar uses a text-colored glyph (`▓`) for allocated space and the theme's
+  success color for savings (`▒`) to the size baseline. Btrfs, NTFS, and estimate
+  results use separate bar scales. A `~` prefix marks both numeric values on
+  fallback rows: the allocated-space estimate in Ratio/Used and the apparent-size
   estimate in Size.
 - `du` estimates are not Btrfs extent statistics. Shared extents can make
   allocated-space totals differ from unique physical usage.
