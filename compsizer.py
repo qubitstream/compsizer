@@ -2512,8 +2512,8 @@ class DirectoryRow(Static):
             size = "—"
 
         theme_styles: ThemeStyles | None = None
-        if self.is_attached:
-            theme_styles = ThemeStyles.from_theme(self.app.current_theme)
+        if self.is_attached and isinstance(self.app, CompsizerApp):
+            theme_styles = self.app._theme_styles_for_rows()
 
         line = Text()
         line.append(pad_right(name, NAME_COLUMN_WIDTH))
@@ -3347,6 +3347,8 @@ class CompsizerApp(App[None]):
         self._row_refresh_pending = False
         self._page_index = 0
         self._bar_scales = BarScales(0, 0)
+        self._row_styles_theme: Theme | None = None
+        self._row_styles: ThemeStyles | None = None
         self._scan_priority_task: asyncio.Task[Any] | None = None
         self._scan_priority_pending = False
         self._startup_notices: list[str] = []
@@ -3728,6 +3730,15 @@ class CompsizerApp(App[None]):
             and filesystem_key != self._supported_filesystem_type.casefold()
         )
         return filesystem_type if differs_from_current or is_unsupported else None
+
+    def _theme_styles_for_rows(self) -> ThemeStyles:
+        """Reuse Rich styles until Textual selects a different theme."""
+
+        theme = self.current_theme
+        if theme is not self._row_styles_theme or self._row_styles is None:
+            self._row_styles = ThemeStyles.from_theme(theme)
+            self._row_styles_theme = theme
+        return self._row_styles
 
     def _schedule_row_render(self) -> None:
         """Coalesce rapid scan updates into one short UI refresh window."""

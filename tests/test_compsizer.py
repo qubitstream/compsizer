@@ -512,6 +512,27 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(styles.warning.color.triplet, ColorTriplet(0, 255, 255))
         self.assertEqual(styles.error.color.triplet, ColorTriplet(255, 255, 0))
 
+    def test_app_caches_row_styles_until_the_theme_changes(self) -> None:
+        app = CompsizerApp(Path("/root"), runner=FakeRunner())
+        default_styles = app._theme_styles_for_rows()
+
+        self.assertIs(default_styles, app._theme_styles_for_rows())
+
+        theme = Theme(
+            name="cached-row-theme",
+            primary="#123456",
+            success="#ff00ff",
+        )
+        app.register_theme(theme)
+        app.theme = theme.name
+        updated_styles = app._theme_styles_for_rows()
+
+        self.assertIsNot(default_styles, updated_styles)
+        self.assertEqual(
+            updated_styles.success.color.triplet, ColorTriplet(255, 0, 255)
+        )
+        self.assertIs(updated_styles, app._theme_styles_for_rows())
+
     def test_flags_distinguish_compressed_uncompressed_and_unknown(self) -> None:
         expected_flags = (
             (CompressionStatus.PRESENT, False, None, "C"),
