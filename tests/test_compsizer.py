@@ -737,8 +737,10 @@ class NavigationTests(unittest.TestCase):
             scanner.__exit__.return_value = None
             scanner.__iter__.return_value = iter((directory_symlink,))
 
+            # Keep pathlib on the host path flavor while simulating Windows.
             with (
                 patch("compsizer.os.name", "nt"),
+                patch("compsizer.Path", type(root)),
                 patch("compsizer._scandir_path", return_value=os.fspath(root)),
                 patch("compsizer.os.scandir", return_value=scanner),
             ):
@@ -1449,13 +1451,18 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
             app = CompsizerApp(root, runner=FakeRunner())
 
             async with app.run_test(size=(120, 30)) as pilot:
+                header = app.query_one("#column-label", DirectoryColumnHeader)
                 for _ in range(100):
                     rows = tuple(app._row_widgets.values())
-                    if rows and rows[0].record.result.state is ScanState.COMPLETE:
+                    if (
+                        rows
+                        and rows[0].record.result.state is ScanState.COMPLETE
+                        and header.size.width > 0
+                        and header.size.width == rows[0].size.width
+                    ):
                         break
                     await pilot.pause(0.01)
 
-                header = app.query_one("#column-label", DirectoryColumnHeader)
                 row = next(iter(app._row_widgets.values()))
                 header_text = header.render().plain
                 row_text = row.render().plain
@@ -1819,6 +1826,7 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     self.assertNotIsInstance(app.screen, ElevatedScanPrompt)
 
+    @unittest.skipUnless(os.name == "posix", "Uses POSIX shell test executables")
     async def test_declining_elevation_displays_du_size_estimates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -2394,6 +2402,7 @@ class WindowsApiTests(unittest.TestCase):
             self.assertGreaterEqual(metadata.allocated_size, 0)
 
 
+@unittest.skipUnless(os.name == "posix", "Exercises POSIX command-line runners")
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
     """Test subprocess, fallback, and elevation behavior without Btrfs."""
 

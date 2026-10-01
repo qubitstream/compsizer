@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.11"
+          - "3.14"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and select Python
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.21"
+          python-version: ${{ matrix.python-version }}
+          cache-dependency-glob: compsizer.py
+
+      - name: Install Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Run tests
+        run: uv run --with textual python -m unittest discover -s tests -v
+
+  quality:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv and Python 3.11
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.21"
+          python-version: "3.11"
+          cache-dependency-glob: compsizer.py
+
+      - name: Install Python 3.11
+        run: uv python install 3.11
+
+      - name: Check lint
+        run: uv run --with ruff ruff check compsizer.py tests/test_compsizer.py
+
+      - name: Check formatting
+        run: uv run --with ruff ruff format --check compsizer.py tests/test_compsizer.py
+
+      - name: Check types
+        run: |
+          textual_site_packages="$(uv run --with textual python -c 'import os, textual; print(os.path.dirname(os.path.dirname(textual.__file__)))')"
+          PYTHONPATH="$textual_site_packages" uv run --with ty ty check compsizer.py
