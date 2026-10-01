@@ -71,6 +71,7 @@ Log files may include full filesystem paths.
 | `Tab`                    | Switch panes; in the path prompt, complete the selected suggestion |
 | `g`                      | Enter a path or search up to 100 child folders                     |
 | `i`                      | Show details for the selected folder                               |
+| `a`                      | Show About and license                                             |
 | `s`                      | Change sorting: size, ratio, savings, or name                      |
 | `r`                      | Refresh the current folder and its measurements                    |
 | `c`                      | Turn the in-memory result cache on or off                          |

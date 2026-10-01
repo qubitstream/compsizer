@@ -1498,6 +1498,25 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("uncompressed extent bytes. On NTFS", help_text)
                 self.assertIn("allocated bytes with logical bytes", help_text)
+                self.assertIn("a               Show About and license", help_text)
+
+    async def test_about_shows_copyright_and_license(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            app = CompsizerApp(Path(temporary_directory), runner=FakeRunner())
+
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.press("a")
+                await pilot.pause()
+
+                about_text = app.screen.query_one("#about-text", Static).render().plain
+                self.assertIn("Copyright (C) 2026 Christoph Haunschmidt", about_text)
+                self.assertIn("GNU General Public License v3.0 or later", about_text)
+                self.assertIn("GPL-3.0-or-later", about_text)
+                self.assertIn("full license text is in LICENSE", about_text)
+
+                await pilot.press("escape")
+                await pilot.pause()
+                app.screen.query_one("#directory-list", ListView)
 
     async def test_status_diagnostics_fit_within_two_lines(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -2629,6 +2629,7 @@ class HelpScreen(ModalScreen[None]):
             "r               Refresh current directory and rescan\n"
             "g               Go to a path; search child names by substring\n"
             "i               Show selected row details\n"
+            "a               Show About and license\n"
             "?               Show this help\n"
             "q               Quit\n\n"
             "Bars show allocated usage (▓) in the text color and savings (▒) "
@@ -2656,6 +2657,51 @@ class HelpScreen(ModalScreen[None]):
 
     def action_close(self) -> None:
         """Close the help dialog."""
+
+        self.dismiss(None)
+
+
+class AboutScreen(ModalScreen[None]):
+    """Show Compsizer's copyright and license information."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "close", "Close", show=False),
+    ]
+
+    CSS = """
+    AboutScreen {
+        align: center middle;
+    }
+    #about-dialog {
+        width: 72;
+        max-width: 92%;
+        height: auto;
+        max-height: 85%;
+        padding: 1 2;
+        border: round $accent;
+        background: $surface;
+    }
+    #about-text {
+        width: 1fr;
+        height: auto;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        """Compose the About and license dialog."""
+
+        text = (
+            "Compsizer\n\n"
+            "Copyright (C) 2026 Christoph Haunschmidt\n\n"
+            "License: GNU General Public License v3.0 or later\n"
+            "SPDX identifier: GPL-3.0-or-later\n\n"
+            "The full license text is in LICENSE.\n\n"
+            "Esc  Close"
+        )
+        yield Container(Static(Text(text), id="about-text"), id="about-dialog")
+
+    def action_close(self) -> None:
+        """Close the About dialog."""
 
         self.dismiss(None)
 
@@ -3311,6 +3357,7 @@ class CompsizerApp(App[None]):
         Binding("r", "refresh_view", "Refresh"),
         Binding("g", "go_to_path", "Go to path"),
         Binding("i", "show_details", "Details"),
+        Binding("a", "show_about", "About", show=False),
         Binding("?", "show_help", "Help"),
     ]
 
@@ -4209,6 +4256,11 @@ class CompsizerApp(App[None]):
         """Open the keyboard and semantics help screen."""
 
         self.push_screen(HelpScreen())
+
+    def action_show_about(self) -> None:
+        """Open the copyright and license information screen."""
+
+        self.push_screen(AboutScreen())
 
     def action_show_details(self) -> None:
         """Show full details for the selected directory scan."""
