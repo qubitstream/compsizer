@@ -7,7 +7,7 @@ import threading
 import unittest
 from contextlib import nullcontext, redirect_stderr
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from rich.color import ColorTriplet
 from textual.theme import Theme
@@ -103,7 +103,7 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(stderr.getvalue(), "")
             self.assertEqual(LOGGER.level, previous_level)
             self.assertEqual(LOGGER.propagate, previous_propagation)
-            app_class.assert_called_once_with(root)
+            app_class.assert_called_once_with(root.resolve())
 
     def test_log_handler_is_removed_after_the_app_raises(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -682,7 +682,7 @@ class RenderingTests(unittest.TestCase):
 class NavigationTests(unittest.TestCase):
     """Test path normalization and direct directory enumeration."""
 
-    def test_enumeration_skips_files_and_directory_symlinks(self) -> None:
+    def test_enumeration_skips_files_and_handles_directory_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             (root / "real").mkdir()
@@ -695,9 +695,10 @@ class NavigationTests(unittest.TestCase):
 
             listing = enumerate_directories(root)
 
-            self.assertEqual(
-                [entry.name for entry in listing.entries], [".hidden", "real"]
-            )
+            expected_names = [".hidden", "real"]
+            if os.name == "nt":
+                expected_names.insert(1, "linked")
+            self.assertEqual([entry.name for entry in listing.entries], expected_names)
             self.assertTrue(
                 all(entry.kind is EntryKind.DIRECTORY for entry in listing.entries)
             )
@@ -1814,13 +1815,20 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             app = CompsizerApp(Path(temporary_directory), runner=FakeRunner())
+            process = MagicMock(returncode=0)
+            process.wait = AsyncMock()
 
             async with app.run_test(size=(100, 30)) as pilot:
-                with patch.object(
-                    app, "suspend", return_value=nullcontext()
-                ) as suspend:
+                with (
+                    patch.object(app, "suspend", return_value=nullcontext()) as suspend,
+                    patch(
+                        "compsizer.asyncio.create_subprocess_exec",
+                        new_callable=AsyncMock,
+                        return_value=process,
+                    ) as create_subprocess,
+                ):
                     authorization = asyncio.create_task(
-                        app._authorize_elevated_scans(["/bin/true"])
+                        app._authorize_elevated_scans(["test-command"])
                     )
                     await pilot.pause()
                     self.assertIsInstance(app.screen, ElevatedScanPrompt)
@@ -1829,15 +1837,17 @@ class AppTests(unittest.IsolatedAsyncioTestCase):
                     suspend.assert_not_called()
 
                     authorization = asyncio.create_task(
-                        app._authorize_elevated_scans(["/bin/true"])
+                        app._authorize_elevated_scans(["test-command"])
                     )
                     await pilot.pause()
                     await pilot.press("y")
                     self.assertTrue(await authorization)
                     suspend.assert_called_once()
+                    create_subprocess.assert_awaited_once()
+                    process.wait.assert_awaited_once()
 
                     authorization = asyncio.create_task(
-                        app._authorize_elevated_scans(["/bin/true"])
+                        app._authorize_elevated_scans(["test-command"])
                     )
                     await pilot.pause()
                     authorization.cancel()
